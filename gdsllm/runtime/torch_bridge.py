@@ -156,3 +156,99 @@ class ModelWeights:
         """Return model configuration from metadata."""
         exclude = {"files", "alignment"}
         return {k: v for k, v in self.metadata.items() if k not in exclude}
+
+
+class LayerCache:
+    """VRAM cache for model layers loaded via GDS.
+
+    Keeps loaded layers resident in VRAM to avoid repeated NVMe reads.
+    Automatically determines how many layers fit based on available VRAM.
+    """
+
+    def __init__(
+        self,
+        model_weights: ModelWeights,
+        vram_reserve_mb: int = 1024,
+        device: int = 0,
+    ):
+        self._weights = model_weights
+        self._device = device
+        self._layer_cache: Dict[int, Tuple[Dict[str, torch.Tensor], object]] = {}
+        self._special_cache: Dict[str, Tuple[Dict[str, torch.Tensor], object]] = {}
+        self._hits = 0
+        self._misses = 0
+
+        # Compute VRAM budget from actual free memory
+        free_vram, _total = torch.cuda.mem_get_info(device)
+        reserve = vram_reserve_mb * 1024 * 1024
+        self._budget = max(0, free_vram - reserve)
+        self._used = 0
+
+    def _fits(self, size_bytes: int) -> bool:
+        return self._used + size_bytes <= self._budget
+
+    def get_layer(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get a layer's tensors, loading from NVMe if not cached."""
+        if idx in self._layer_cache:
+            self._hits += 1
+            return self._layer_cache[idx][0]
+
+        self._misses += 1
+        tensors, handle = self._weights.load_layer(idx)
+        layer_size = self._weights.layers[idx].size_bytes
+
+        if self._fits(layer_size):
+            self._layer_cache[idx] = (tensors, handle)
+            self._used += layer_size
+
+        return tensors
+
+    def get_special(self, name: str) -> Dict[str, torch.Tensor]:
+        """Get special tensors (embed_tokens, final_norm, lm_head)."""
+        if name in self._special_cache:
+            self._hits += 1
+            return self._special_cache[name][0]
+
+        self._misses += 1
+        tensors, handle = self._weights.load_special(name)
+        meta = self._weights.special[name]
+        file_size = meta.size_bytes
+
+        if self._fits(file_size):
+            self._special_cache[name] = (tensors, handle)
+            self._used += file_size
+
+        return tensors
+
+    def preload(self):
+        """Load all weights that fit into VRAM upfront."""
+        # Specials first (small, always needed)
+        for name in ("embed_tokens", "final_norm", "lm_head"):
+            if self._weights.special.get(name) is not None:
+                self.get_special(name)
+
+        # Then layers in order
+        for idx in range(self._weights.num_layers):
+            layer_size = self._weights.layers[idx].size_bytes
+            if not self._fits(layer_size):
+                break
+            self.get_layer(idx)
+
+    def evict_all(self):
+        """Free all cached layers from VRAM."""
+        self._layer_cache.clear()
+        self._special_cache.clear()
+        self._used = 0
+        torch.cuda.empty_cache()
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "cached_layers": len(self._layer_cache),
+            "total_layers": self._weights.num_layers,
+            "cached_specials": len(self._special_cache),
+            "vram_used_mb": self._used / (1024 * 1024),
+            "vram_budget_mb": self._budget / (1024 * 1024),
+            "hits": self._hits,
+            "misses": self._misses,
+        }

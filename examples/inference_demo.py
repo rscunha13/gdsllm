@@ -9,6 +9,13 @@ Usage:
         --model-dir /mnt/SSD2TB/gdsllm_model \
         --tokenizer /path/to/tokenizer.model \
         --prompt "The meaning of life is"
+
+    # With VRAM caching (preload all layers):
+    python examples/inference_demo.py \
+        --model-dir /mnt/SSD2TB/gdsllm_model \
+        --tokenizer /path/to/tokenizer.model \
+        --prompt "The meaning of life is" \
+        --preload
 """
 
 import argparse
@@ -18,15 +25,22 @@ import time
 import torch
 from transformers import AutoTokenizer
 
-from gdsllm.runtime.scheduler import SimpleScheduler
+from gdsllm.runtime.scheduler import SimpleScheduler, CachedScheduler
 
 
-def print_diagnostics(scheduler: SimpleScheduler):
+def print_diagnostics(scheduler):
     """Print GDS and system diagnostics."""
     print("\n=== GdsLLM Diagnostics ===")
     print(f"GDS driver open: {scheduler.weights.is_driver_open()}")
     print(f"Model layers: {scheduler.weights.num_layers}")
     print(f"Config: {scheduler.config}")
+
+    # Cache stats
+    if hasattr(scheduler, "cache") and scheduler.cache is not None:
+        stats = scheduler.cache.stats
+        print(f"Cache: {stats['cached_layers']}/{stats['total_layers']} layers, "
+              f"{stats['cached_specials']} specials, "
+              f"{stats['vram_used_mb']:.0f}/{stats['vram_budget_mb']:.0f} MB")
 
     # GPU info
     if torch.cuda.is_available():
@@ -50,7 +64,7 @@ def print_diagnostics(scheduler: SimpleScheduler):
 
 
 def generate(
-    scheduler: SimpleScheduler,
+    scheduler,
     tokenizer,
     prompt: str,
     max_new_tokens: int = 50,
@@ -60,24 +74,25 @@ def generate(
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     seq_len = input_ids.shape[1]
 
+    mode = "cached" if hasattr(scheduler, "cache") else "streaming"
     print(f"Prompt: {prompt}")
     print(f"Input tokens: {seq_len}")
-    print(f"GDS driver open: {scheduler.weights.is_driver_open()}")
+    print(f"Mode: {mode}")
     print(f"Generating (max {max_new_tokens} tokens)...\n")
 
     generated = input_ids[0].tolist()
+    token_times = []
 
     for step in range(max_new_tokens):
         t0 = time.time()
 
-        # Full forward pass (no KV cache in MVP)
+        # Full forward pass (no KV cache)
         input_tensor = torch.tensor([generated], dtype=torch.long)
         logits = scheduler.forward(input_tensor)
 
         # Sample next token
         next_logits = logits[0, -1, :]
         if temperature <= 0:
-            # Greedy
             next_token = next_logits.argmax().item()
         else:
             probs = torch.softmax(next_logits / temperature, dim=-1)
@@ -85,6 +100,7 @@ def generate(
 
         generated.append(next_token)
         elapsed = time.time() - t0
+        token_times.append(elapsed)
 
         # Decode and print
         decoded = tokenizer.decode([next_token])
@@ -95,12 +111,30 @@ def generate(
             f"({elapsed:.2f}s, VRAM: {vram_mb:.0f}MB)"
         )
 
-        # Stop on EOS
         if next_token == tokenizer.eos_token_id:
             break
 
     output_text = tokenizer.decode(generated, skip_special_tokens=True)
     print(f"\n--- Output ---\n{output_text}\n")
+
+    # Summary
+    if token_times:
+        print(f"--- Timing ---")
+        print(f"  First token:  {token_times[0]:.2f}s")
+        if len(token_times) > 1:
+            avg_rest = sum(token_times[1:]) / len(token_times[1:])
+            print(f"  Avg (rest):   {avg_rest:.2f}s")
+            print(f"  Speedup:      {token_times[0] / avg_rest:.1f}x" if avg_rest > 0 else "")
+        print(f"  Total:        {sum(token_times):.2f}s for {len(token_times)} tokens")
+
+    # Cache stats
+    if hasattr(scheduler, "cache") and scheduler.cache is not None:
+        stats = scheduler.cache.stats
+        print(f"\n--- Cache Stats ---")
+        print(f"  Hits: {stats['hits']}, Misses: {stats['misses']}")
+        print(f"  Cached: {stats['cached_layers']}/{stats['total_layers']} layers")
+        print(f"  VRAM used: {stats['vram_used_mb']:.0f} MB")
+
     return output_text
 
 
@@ -136,9 +170,20 @@ def main():
         help="Sampling temperature (0 = greedy)",
     )
     parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Preload all layers into VRAM (uses CachedScheduler)",
+    )
+    parser.add_argument(
+        "--vram-reserve",
+        type=int,
+        default=1024,
+        help="VRAM to reserve for activations in MB (default: 1024)",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
-        help="Print GDS and system diagnostics before generation",
+        help="Print GDS and system diagnostics",
     )
     args = parser.parse_args()
 
@@ -146,8 +191,24 @@ def main():
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    # Run inference
-    with SimpleScheduler(args.model_dir) as scheduler:
+    # Choose scheduler
+    if args.preload:
+        print("Using CachedScheduler with VRAM preload...")
+        ctx = CachedScheduler(
+            args.model_dir,
+            preload=True,
+            vram_reserve_mb=args.vram_reserve,
+        )
+    else:
+        print("Using SimpleScheduler (load/free per layer)...")
+        ctx = SimpleScheduler(args.model_dir)
+
+    t_preload = time.time()
+    with ctx as scheduler:
+        preload_time = time.time() - t_preload
+        if args.preload:
+            print(f"Preload complete in {preload_time:.2f}s")
+
         if args.verify:
             print_diagnostics(scheduler)
 
