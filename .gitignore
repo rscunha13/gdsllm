@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+
+# Model weights (large binary files)
+model/
+
+# CUDA build artifacts
+*.o
+*.a
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# cuFile config (may contain local paths)
+/etc/cufile.json
