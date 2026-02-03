@@ -28,5 +28,6 @@ model/
 .DS_Store
 Thumbs.db
 
-# cuFile config (may contain local paths)
+# cuFile runtime logs and config
+cufile.log
 /etc/cufile.json
