@@ -103,22 +103,25 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def _dequant_gguf(meta: dict) -> torch.Tensor:
+def _dequant_gguf(meta: dict, scratch: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Dequantize a GGUF block-quantized tensor on GPU.
 
     Args:
         meta: dict with keys 'buffer', 'shape', 'gguf_type', 'offset'
+        scratch: optional pre-allocated fp16 buffer to write into
     Returns:
-        fp16 tensor
+        fp16 tensor (view into scratch if provided)
     """
     from gdsllm.runtime import gds_io_ext
     return gds_io_ext.dequant_gguf(
-        meta["buffer"], meta["shape"], meta["gguf_type"], meta["offset"]
+        meta["buffer"], meta["shape"], meta["gguf_type"], meta["offset"],
+        scratch,
     )
 
 
 def dequant_linear(
-    x: torch.Tensor, weights: Dict[str, torch.Tensor], name: str
+    x: torch.Tensor, weights: Dict[str, torch.Tensor], name: str,
+    scratch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """F.linear with on-the-fly dequantization (INT8, GGUF Q4_0/Q8_0).
 
@@ -128,7 +131,7 @@ def dequant_linear(
     """
     w = weights[f"{name}.weight"]
     if isinstance(w, dict) and "gguf_type" in w:
-        w = _dequant_gguf(w)
+        w = _dequant_gguf(w, scratch)
     elif w.dtype == torch.int8:
         scale = weights[f"{name}.scale"]
         w = w.float() * scale  # broadcast [out, in] * [1, in]
@@ -159,6 +162,7 @@ def attention(
     num_kv_heads: int,
     kv_cache=None,
     layer_idx: int = 0,
+    scratch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Multi-head self-attention (supports GQA and optional KV cache).
 
@@ -171,15 +175,16 @@ def attention(
         num_kv_heads: number of KV heads
         kv_cache: optional KVCache instance for incremental decoding
         layer_idx: transformer layer index (used with kv_cache)
+        scratch: optional pre-allocated fp16 buffer for dequantization
     """
     batch, seq_len, hidden_size = x.shape
     head_dim = hidden_size // num_heads
     n_rep = num_heads // num_kv_heads
 
     # Project Q, K, V
-    xq = dequant_linear(x, weights, "self_attn.q_proj")
-    xk = dequant_linear(x, weights, "self_attn.k_proj")
-    xv = dequant_linear(x, weights, "self_attn.v_proj")
+    xq = dequant_linear(x, weights, "self_attn.q_proj", scratch)
+    xk = dequant_linear(x, weights, "self_attn.k_proj", scratch)
+    xv = dequant_linear(x, weights, "self_attn.v_proj", scratch)
 
     # Reshape for multi-head: (batch, seq, num_heads, head_dim)
     xq = xq.view(batch, seq_len, num_heads, head_dim)
@@ -211,14 +216,17 @@ def attention(
 
     # Reshape and project output
     output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-    return dequant_linear(output, weights, "self_attn.o_proj")
+    return dequant_linear(output, weights, "self_attn.o_proj", scratch)
 
 
-def mlp(x: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
+def mlp(
+    x: torch.Tensor, weights: Dict[str, torch.Tensor],
+    scratch: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """SwiGLU MLP as used in LLaMA."""
-    gate = dequant_linear(x, weights, "mlp.gate_proj")
-    up = dequant_linear(x, weights, "mlp.up_proj")
-    return dequant_linear(F.silu(gate) * up, weights, "mlp.down_proj")
+    gate = dequant_linear(x, weights, "mlp.gate_proj", scratch)
+    up = dequant_linear(x, weights, "mlp.up_proj", scratch)
+    return dequant_linear(F.silu(gate) * up, weights, "mlp.down_proj", scratch)
 
 
 def transformer_block(
@@ -231,19 +239,20 @@ def transformer_block(
     rms_norm_eps: float = 1e-5,
     kv_cache=None,
     layer_idx: int = 0,
+    scratch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One transformer layer (pre-norm architecture)."""
     # Self-attention with residual
     h = rms_norm(x, weights["input_layernorm.weight"], rms_norm_eps)
     h = attention(
         h, weights, freqs_cis, mask, num_heads, num_kv_heads,
-        kv_cache=kv_cache, layer_idx=layer_idx,
+        kv_cache=kv_cache, layer_idx=layer_idx, scratch=scratch,
     )
     x = x + h
 
     # MLP with residual
     h = rms_norm(x, weights["post_attention_layernorm.weight"], rms_norm_eps)
-    h = mlp(h, weights)
+    h = mlp(h, weights, scratch)
     x = x + h
 
     return x

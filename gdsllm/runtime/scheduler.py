@@ -19,7 +19,7 @@ from gdsllm.runtime.llama import (
 )
 
 
-def _embed_tokens(token_ids, tensors):
+def _embed_tokens(token_ids, tensors, scratch=None):
     """Embedding lookup with INT8 and GGUF dequantization support.
 
     For INT8, only dequantizes the rows needed (avoids 4 GB float32 temp
@@ -30,7 +30,7 @@ def _embed_tokens(token_ids, tensors):
     w = tensors["model.embed_tokens.weight"]
     if isinstance(w, dict) and "gguf_type" in w:
         # GGUF: must dequant full table, then lookup
-        w_fp16 = _dequant_gguf(w)
+        w_fp16 = _dequant_gguf(w, scratch)
         h = F.embedding(token_ids, w_fp16)
         del w_fp16
     elif w.dtype == torch.int8:
@@ -43,7 +43,7 @@ def _embed_tokens(token_ids, tensors):
     return h
 
 
-def _lm_head_proj(h, tensors, key="lm_head.weight"):
+def _lm_head_proj(h, tensors, key="lm_head.weight", scratch=None):
     """LM head projection with INT8 and GGUF dequantization support.
 
     For large vocab models (70B+), dequantizes in chunks to avoid
@@ -52,7 +52,7 @@ def _lm_head_proj(h, tensors, key="lm_head.weight"):
     """
     w = tensors[key]
     if isinstance(w, dict) and "gguf_type" in w:
-        w = _dequant_gguf(w)
+        w = _dequant_gguf(w, scratch)
     elif w.dtype == torch.int8:
         scale_key = key.rsplit(".weight", 1)[0] + ".scale"
         scale = tensors[scale_key]
@@ -69,6 +69,27 @@ def _lm_head_proj(h, tensors, key="lm_head.weight"):
     return F.linear(h, w)
 
 
+def _alloc_dequant_scratch(weights: ModelWeights, device: torch.device):
+    """Allocate a reusable fp16 scratch buffer for GGUF dequantization.
+
+    Sized for the largest block-quantized weight across transformer layers
+    (not specials — embed/lm_head are called once per pass, not worth the
+    VRAM cost of a 2 GB scratch for vocab-sized weights).
+    Returns None if the model has no GGUF-quantized layer weights.
+    """
+    max_elements = 0
+    for layer in weights.layers:
+        for t in layer.tensors:
+            if t.quant in ("q4_0", "q8_0"):
+                elems = 1
+                for s in t.shape:
+                    elems *= s
+                max_elements = max(max_elements, elems)
+    if max_elements == 0:
+        return None
+    return torch.empty(max_elements, dtype=torch.float16, device=device)
+
+
 class SimpleScheduler:
     """Layer-by-layer LLaMA inference with GDS weight streaming."""
 
@@ -76,6 +97,7 @@ class SimpleScheduler:
         self.weights = ModelWeights(model_dir)
         self.device = torch.device(device)
         self.config = self.weights.config
+        self._scratch = None
 
         # Precompute RoPE frequencies (small, lives in VRAM permanently)
         self.freqs_cis = precompute_freqs_cis(
@@ -88,6 +110,7 @@ class SimpleScheduler:
 
     def __enter__(self):
         self.weights.init_gds()
+        self._scratch = _alloc_dequant_scratch(self.weights, self.device)
         return self
 
     def __exit__(self, *args):
@@ -120,7 +143,9 @@ class SimpleScheduler:
         num_kv_heads = self.config["num_kv_heads"]
         rms_norm_eps = self.config["rms_norm_eps"]
 
-        # Step 1: Token embeddings
+        scratch = self._scratch
+
+        # Step 1: Token embeddings (no scratch — vocab weights too large)
         embed_tensors, embed_buf = self.weights.load_special("embed_tokens")
         h = _embed_tokens(token_ids.to(self.device), embed_tensors)
         del embed_tensors, embed_buf
@@ -142,13 +167,14 @@ class SimpleScheduler:
         # Step 3: RoPE frequencies at correct positions
         freqs = self.freqs_cis[start_pos : start_pos + seq_len]
 
-        # Step 4: Transformer layers
+        # Step 4: Transformer layers (scratch reused across all dequant calls)
         for layer_idx in range(self.weights.num_layers):
             layer_tensors, layer_buf = self.weights.load_layer(layer_idx)
             h = transformer_block(
                 h, layer_tensors, freqs, mask,
                 num_heads, num_kv_heads, rms_norm_eps,
                 kv_cache=kv_cache, layer_idx=layer_idx,
+                scratch=scratch,
             )
             del layer_tensors, layer_buf
             torch.cuda.empty_cache()
@@ -163,13 +189,12 @@ class SimpleScheduler:
         del norm_tensors, norm_buf
         torch.cuda.empty_cache()
 
-        # Step 6: LM head
+        # Step 6: LM head (no scratch — vocab weights too large)
         if self.weights.special["lm_head"] is not None:
             lm_tensors, lm_buf = self.weights.load_special("lm_head")
             logits = _lm_head_proj(h, lm_tensors, "lm_head.weight")
             del lm_tensors, lm_buf
         else:
-            # Tied weights: reload embed_tokens for projection
             embed_tensors, embed_buf = self.weights.load_special("embed_tokens")
             logits = _lm_head_proj(h, embed_tensors, "model.embed_tokens.weight")
             del embed_tensors, embed_buf
@@ -218,9 +243,9 @@ def estimate_activation_vram(
         largest_weight = max(vocab_size * hidden_size, intermediate_size * hidden_size)
         dequant_scratch = largest_weight * (4 + 2)  # float32 + half
     elif quantization in ("q4_0", "q8_0"):
-        # GGUF: dequant produces fp16 directly (no float32 intermediate)
-        largest_weight = max(vocab_size * hidden_size, intermediate_size * hidden_size)
-        dequant_scratch = largest_weight * 2  # fp16 output only
+        # GGUF: layer dequant uses pre-allocated scratch (no extra cost),
+        # but embed_tokens / lm_head still allocate one-shot fp16 output
+        dequant_scratch = vocab_size * hidden_size * 2  # fp16 embed/lm_head
     else:
         dequant_scratch = 0
 
@@ -249,6 +274,7 @@ class CachedScheduler:
         self._preload = preload
         self._max_seq_len = max_seq_len or self.config["max_seq_len"]
         self.cache: Optional[LayerCache] = None
+        self._scratch = None
 
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(
@@ -261,6 +287,7 @@ class CachedScheduler:
 
     def __enter__(self):
         self.weights.init_gds()
+        self._scratch = _alloc_dequant_scratch(self.weights, self.device)
         self.cache = LayerCache(self.weights)
         if self._preload:
             # Reserve VRAM for activations at max_seq_len during preload
@@ -295,7 +322,9 @@ class CachedScheduler:
         num_kv_heads = self.config["num_kv_heads"]
         rms_norm_eps = self.config["rms_norm_eps"]
 
-        # Step 1: Token embeddings
+        scratch = self._scratch
+
+        # Step 1: Token embeddings (no scratch — vocab weights too large)
         embed_tensors = self.cache.get_special("embed_tokens")
         h = _embed_tokens(token_ids.to(self.device), embed_tensors)
 
@@ -323,7 +352,7 @@ class CachedScheduler:
         layer_buf = max(l.size_bytes for l in self.weights.layers)
         self.cache.ensure_free_vram(activation_need + layer_buf)
 
-        # Step 5: Transformer layers
+        # Step 5: Transformer layers (scratch reused across all dequant calls)
         for layer_idx in range(self.weights.num_layers):
             layer_tensors = self.cache.get_layer(
                 layer_idx, min_free=activation_need
@@ -332,6 +361,7 @@ class CachedScheduler:
                 h, layer_tensors, freqs, mask,
                 num_heads, num_kv_heads, rms_norm_eps,
                 kv_cache=kv_cache, layer_idx=layer_idx,
+                scratch=scratch,
             )
 
         # Advance KV cache after all layers
@@ -345,7 +375,7 @@ class CachedScheduler:
         norm_tensors = self.cache.get_special("final_norm")
         h = rms_norm(h, norm_tensors["model.norm.weight"], rms_norm_eps)
 
-        # Step 7: LM head
+        # Step 7: LM head (no scratch — vocab weights too large)
         if self.weights.special["lm_head"] is not None:
             lm_tensors = self.cache.get_special("lm_head")
             logits = _lm_head_proj(h, lm_tensors, "lm_head.weight")

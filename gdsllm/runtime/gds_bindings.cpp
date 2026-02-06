@@ -194,7 +194,8 @@ static torch::Tensor py_dequant_gguf(
     std::shared_ptr<GdsBufferHandle> handle,
     std::vector<int64_t> shape,
     const std::string& gguf_type,
-    int64_t offset
+    int64_t offset,
+    c10::optional<torch::Tensor> output_tensor
 ) {
     if (!handle || !handle->dev_ptr()) {
         throw std::runtime_error("py_dequant_gguf: invalid buffer handle");
@@ -214,11 +215,25 @@ static torch::Tensor py_dequant_gguf(
     // Source pointer in the GDS buffer
     const void* src = static_cast<const char*>(handle->dev_ptr()) + offset;
 
-    // Allocate output fp16 tensor
-    auto options = torch::TensorOptions()
-        .dtype(torch::kFloat16)
-        .device(torch::kCUDA, handle->device_id());
-    torch::Tensor output = torch::empty(shape, options);
+    // Use pre-allocated output tensor if provided, otherwise allocate
+    torch::Tensor output;
+    if (output_tensor.has_value()) {
+        output = output_tensor.value();
+        // Reshape scratch to match requested shape (must have enough elements)
+        if (output.numel() < num_elements) {
+            throw std::runtime_error(
+                "py_dequant_gguf: scratch buffer too small (" +
+                std::to_string(output.numel()) + " < " +
+                std::to_string(num_elements) + ")");
+        }
+        // Return a view with the correct shape (avoids reallocation)
+        output = output.flatten().slice(0, 0, num_elements).view(shape);
+    } else {
+        auto options = torch::TensorOptions()
+            .dtype(torch::kFloat16)
+            .device(torch::kCUDA, handle->device_id());
+        output = torch::empty(shape, options);
+    }
 
     __half* dst = reinterpret_cast<__half*>(output.data_ptr());
 
@@ -289,5 +304,6 @@ PYBIND11_MODULE(gds_io_ext, m) {
           py::arg("handle"),
           py::arg("shape"),
           py::arg("gguf_type"),
-          py::arg("offset"));
+          py::arg("offset"),
+          py::arg("output") = py::none());
 }
