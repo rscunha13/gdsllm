@@ -66,14 +66,46 @@ Double-buffering (load next layer while computing current) would hide most of th
 
 `py_dequant_gguf()` in `gdsllm/runtime/gds_bindings.cpp:218-221` allocates a fresh fp16 tensor every call via `torch::empty()`. For a single layer's 7 projections, that's 7 allocations and deallocations of large tensors (up to ~64 MB each). CUDA's memory allocator is not free — each `cudaMalloc`/`cudaFree` pair has overhead. A pre-allocated scratch buffer reused across projections would eliminate this.
 
+## Optimization Results
+
+### Phase 1.1: Reusable scratch buffer (Bottleneck #6)
+
+Pre-allocate a single fp16 buffer (448 MB for 70B) sized for the largest per-layer
+weight. Reuse across all 7 dequant calls per layer instead of 511 torch::empty()/free
+cycles per token.
+
+**Result: 17% faster** — decode avg 7.689s → 6.356s/tok. Also eliminated timing
+variance (6.3–11.0s → 6.3–6.5s). The allocation jitter was causing intermittent stalls.
+
+### Phase 2: Double-buffering I/O (Bottleneck #5) — NO IMPROVEMENT
+
+Implemented async prefetch (std::async bg thread for cuFileRead, buffer allocation on
+main thread). Tested: 6.432s/tok vs 6.356s baseline — no measurable benefit.
+
+**Why it doesn't help:** GDS reads already overlap naturally with GPU compute because:
+1. `gds_read()` blocks the CPU but not the GPU (DMA transfer)
+2. PyTorch kernel launches are async (return to CPU in µs)
+3. While CPU blocks on `load_layer(N+1)`, GPU executes `transformer_block(N)` concurrently
+
+The synchronous case effectively already achieves double-buffering at the hardware level.
+Explicit async prefetch adds thread overhead for no benefit. **Reverted.**
+
+### Phase 3: Fused dequant+GEMM (Bottleneck #1) — TODO
+
+This remains the primary bottleneck. The two-kernel pattern (dequant → fp16 temp → matmul)
+forces the GPU to fully complete the dequant before starting the matmul, with no
+opportunity for pipelining. A fused kernel would stream blocks, dequantize to registers,
+and feed directly into the GEMM, eliminating the fp16 intermediate entirely.
+
 ## Summary (ranked by impact)
 
-| Bottleneck | Est. GPU idle | Fix |
-|---|---|---|
-| Dequant→matmul two-phase | ~15-20% | Fused dequant+GEMM kernel |
-| Synchronous NVMe I/O | ~10% | Double-buffering / async prefetch |
-| Per-call fp16 allocation | ~3-5% | Reusable scratch buffer |
-| Dequant kernel efficiency | ~2-3% | Warp-level, coalesced writes |
-| Python→C++ roundtrips | ~1-2% | Batch dequant per layer |
+| Bottleneck | Est. GPU idle | Fix | Status |
+|---|---|---|---|
+| Dequant→matmul two-phase | ~15-20% | Fused dequant+GEMM kernel | TODO |
+| ~~Synchronous NVMe I/O~~ | ~~10%~~ | ~~Double-buffering~~ | **Not a bottleneck** |
+| ~~Per-call fp16 allocation~~ | ~~3-5%~~ | ~~Reusable scratch buffer~~ | **Done: -17%** |
+| Dequant kernel efficiency | ~2-3% | Warp-level, coalesced writes | TODO |
+| Python→C++ roundtrips | ~1-2% | Batch dequant per layer | TODO |
 
-The ~70% GPU utilization is consistent with the GPU being starved by the two-phase dequant+matmul pattern and synchronous I/O. The dequant kernel itself is fast (memory-bound, tiny vs matmul time), but the serialization and allocation overhead between dequant and matmul keeps the GPU waiting.
+Current decode: **6.36s/tok** (from 7.69s baseline). Remaining ~83% of decode time is
+dominated by the dequant→matmul serialization pattern (Bottleneck #1).
