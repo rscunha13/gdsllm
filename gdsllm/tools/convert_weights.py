@@ -16,10 +16,12 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 from safetensors import safe_open
 
 
@@ -38,6 +40,43 @@ LAYER_TENSOR_ORDER = [
     "mlp.up_proj.weight",
     "mlp.down_proj.weight",
 ]
+
+# Tensors that are normalization weights (keep fp16 even when quantizing)
+NORM_TENSORS = {
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+}
+
+
+def quantize_tensor_int8(tensor_fp16: np.ndarray) -> tuple:
+    """Per-channel INT8 quantization.
+
+    For a weight matrix W of shape [out_features, in_features]:
+      scale = abs(W).max(dim=0) / 127  — shape [1, in_features], fp16
+      W_int8 = round(W / scale).clamp(-128, 127) — shape [out_features, in_features], int8
+
+    Returns:
+        (tensor_int8, scale_fp16)
+    """
+    assert tensor_fp16.dtype == np.float16
+    w = tensor_fp16.astype(np.float32)
+
+    if w.ndim == 2:
+        # Per-channel (per input-channel) quantization
+        scale = np.abs(w).max(axis=0, keepdims=True) / 127.0  # [1, in]
+    elif w.ndim == 1:
+        # 1D tensor (e.g., bias) — single scale
+        scale = np.array([[np.abs(w).max() / 127.0]], dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported tensor ndim={w.ndim} for int8 quantization")
+
+    # Avoid division by zero
+    scale = np.maximum(scale, 1e-10)
+
+    w_int8 = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
+    scale_fp16 = scale.astype(np.float16)
+
+    return w_int8, scale_fp16
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -60,7 +99,8 @@ def build_tensor_index(safetensors_files: list[str]) -> dict[str, str]:
     """Build a mapping from tensor name -> safetensors file path."""
     index = {}
     for filepath in safetensors_files:
-        with safe_open(filepath, framework="numpy") as f:
+        # Use PyTorch framework to handle bfloat16 (numpy doesn't support it)
+        with safe_open(filepath, framework="pt") as f:
             for key in f.keys():
                 index[key] = filepath
     return index
@@ -73,11 +113,11 @@ def read_tensor(
     if tensor_name not in tensor_index:
         raise KeyError(f"Tensor '{tensor_name}' not found in safetensors files")
     filepath = tensor_index[tensor_name]
-    with safe_open(filepath, framework="numpy") as f:
+    # Use PyTorch framework to handle bfloat16 (numpy doesn't support it)
+    with safe_open(filepath, framework="pt") as f:
         tensor = f.get_tensor(tensor_name)
-    # Ensure float16 and C-contiguous
-    if tensor.dtype != np.float16:
-        tensor = tensor.astype(np.float16)
+    # Convert to float16 numpy (handles bfloat16 -> float16 conversion)
+    tensor = tensor.to(torch.float16).numpy()
     if not tensor.flags["C_CONTIGUOUS"]:
         tensor = np.ascontiguousarray(tensor)
     return tensor
@@ -100,8 +140,12 @@ def convert_layer(
     tensor_index: dict[str, str],
     output_dir: str,
     model_prefix: str = "model.layers",
+    quantize: str = "none",
 ) -> dict:
     """Convert one transformer layer to a flat .bin file.
+
+    Args:
+        quantize: "none" or "int8"
 
     Returns metadata dict for this layer.
     """
@@ -113,19 +157,52 @@ def convert_layer(
         for tensor_suffix in LAYER_TENSOR_ORDER:
             full_name = f"{model_prefix}.{layer_idx}.{tensor_suffix}"
             tensor = read_tensor(tensor_index, full_name)
-            raw_bytes = tensor.tobytes()
-            offset, padded_size = write_aligned(f, raw_bytes)
 
-            tensor_metas.append(
-                {
-                    "name": tensor_suffix,
-                    "shape": list(tensor.shape),
-                    "dtype": "float16",
-                    "offset": offset,
-                    "size_bytes": len(raw_bytes),
-                    "padded_size": padded_size,
-                }
+            should_quantize = (
+                quantize == "int8" and tensor_suffix not in NORM_TENSORS
             )
+
+            if should_quantize:
+                tensor_int8, scale_fp16 = quantize_tensor_int8(tensor)
+
+                # Write int8 weight
+                raw_bytes = tensor_int8.tobytes()
+                offset, padded_size = write_aligned(f, raw_bytes)
+
+                # Write fp16 scale
+                scale_bytes = scale_fp16.tobytes()
+                scale_offset, scale_padded = write_aligned(f, scale_bytes)
+
+                tensor_metas.append(
+                    {
+                        "name": tensor_suffix,
+                        "shape": list(tensor_int8.shape),
+                        "dtype": "int8",
+                        "offset": offset,
+                        "size_bytes": len(raw_bytes),
+                        "padded_size": padded_size,
+                        "quant": "int8",
+                        "scale_shape": list(scale_fp16.shape),
+                        "scale_offset": scale_offset,
+                        "scale_size_bytes": len(scale_bytes),
+                        "scale_padded_size": scale_padded,
+                    }
+                )
+            else:
+                raw_bytes = tensor.tobytes()
+                offset, padded_size = write_aligned(f, raw_bytes)
+
+                tensor_metas.append(
+                    {
+                        "name": tensor_suffix,
+                        "shape": list(tensor.shape),
+                        "dtype": "float16",
+                        "offset": offset,
+                        "size_bytes": len(raw_bytes),
+                        "padded_size": padded_size,
+                        "quant": None,
+                    }
+                )
 
         total_size = f.tell()
 
@@ -142,8 +219,14 @@ def convert_special(
     tensor_index: dict[str, str],
     output_filename: str,
     output_dir: str,
+    quantize: str = "none",
+    force_fp16: bool = False,
 ) -> dict:
     """Convert special tensors (embeddings, norm, lm_head) to a flat .bin file.
+
+    Args:
+        quantize: "none" or "int8"
+        force_fp16: if True, keep fp16 even when quantize="int8" (for norms)
 
     Returns metadata dict.
     """
@@ -153,26 +236,52 @@ def convert_special(
     with open(filepath, "wb") as f:
         for full_name in tensor_names:
             tensor = read_tensor(tensor_index, full_name)
-            raw_bytes = tensor.tobytes()
-            offset, padded_size = write_aligned(f, raw_bytes)
 
-            # Use short name (last part after the last dot-separated prefix)
-            short_name = full_name.split(".")[-1]
-            if short_name == "weight":
-                # Use parent.weight for clarity
-                parts = full_name.split(".")
-                short_name = ".".join(parts[-2:])
-
-            tensor_metas.append(
-                {
-                    "name": full_name,
-                    "shape": list(tensor.shape),
-                    "dtype": "float16",
-                    "offset": offset,
-                    "size_bytes": len(raw_bytes),
-                    "padded_size": padded_size,
-                }
+            should_quantize = (
+                quantize == "int8"
+                and not force_fp16
+                and tensor.ndim == 2  # only quantize 2D weight matrices
             )
+
+            if should_quantize:
+                tensor_int8, scale_fp16 = quantize_tensor_int8(tensor)
+
+                raw_bytes = tensor_int8.tobytes()
+                offset, padded_size = write_aligned(f, raw_bytes)
+
+                scale_bytes = scale_fp16.tobytes()
+                scale_offset, scale_padded = write_aligned(f, scale_bytes)
+
+                tensor_metas.append(
+                    {
+                        "name": full_name,
+                        "shape": list(tensor_int8.shape),
+                        "dtype": "int8",
+                        "offset": offset,
+                        "size_bytes": len(raw_bytes),
+                        "padded_size": padded_size,
+                        "quant": "int8",
+                        "scale_shape": list(scale_fp16.shape),
+                        "scale_offset": scale_offset,
+                        "scale_size_bytes": len(scale_bytes),
+                        "scale_padded_size": scale_padded,
+                    }
+                )
+            else:
+                raw_bytes = tensor.tobytes()
+                offset, padded_size = write_aligned(f, raw_bytes)
+
+                tensor_metas.append(
+                    {
+                        "name": full_name,
+                        "shape": list(tensor.shape),
+                        "dtype": "float16",
+                        "offset": offset,
+                        "size_bytes": len(raw_bytes),
+                        "padded_size": padded_size,
+                        "quant": None,
+                    }
+                )
 
         total_size = f.tell()
 
@@ -257,11 +366,56 @@ def try_read_hf_config(model_dir: str, config: dict) -> dict:
     if "max_position_embeddings" in hf_config:
         config["max_seq_len"] = hf_config["max_position_embeddings"]
 
+    # Store RoPE scaling config for Llama 3.x
+    if "rope_scaling" in hf_config and hf_config["rope_scaling"] is not None:
+        config["rope_scaling"] = hf_config["rope_scaling"]
+
     # Recompute head_dim from authoritative values
     if config["num_heads"] > 0:
         config["head_dim"] = config["hidden_size"] // config["num_heads"]
 
     return config
+
+
+def _verify_tensor(f, tmeta: dict, original_fp16: np.ndarray, name: str) -> bool:
+    """Verify a single tensor from a converted file.
+
+    For fp16 tensors: exact match.
+    For int8 quantized: dequantize and check max abs error.
+    """
+    quant = tmeta.get("quant")
+
+    if quant == "int8":
+        # Read int8 weight
+        f.seek(tmeta["offset"])
+        w_int8 = np.frombuffer(
+            f.read(tmeta["size_bytes"]), dtype=np.int8
+        ).reshape(tmeta["shape"])
+
+        # Read fp16 scale
+        f.seek(tmeta["scale_offset"])
+        scale = np.frombuffer(
+            f.read(tmeta["scale_size_bytes"]), dtype=np.float16
+        ).reshape(tmeta["scale_shape"])
+
+        # Dequantize and compare
+        dequant = w_int8.astype(np.float32) * scale.astype(np.float32)
+        orig_f32 = original_fp16.astype(np.float32)
+        max_err = np.abs(dequant - orig_f32).max()
+        if max_err > 0.1:
+            print(f"  INT8 ERROR TOO LARGE: {name} max_abs_error={max_err:.4f}")
+            return False
+        return True
+    else:
+        # Exact fp16 match
+        f.seek(tmeta["offset"])
+        converted = np.frombuffer(
+            f.read(tmeta["size_bytes"]), dtype=np.float16
+        ).reshape(tmeta["shape"])
+        if not np.array_equal(original_fp16, converted):
+            print(f"  MISMATCH: {name}")
+            return False
+        return True
 
 
 def verify_layer(
@@ -277,12 +431,7 @@ def verify_layer(
         for tmeta in layer_meta["tensors"]:
             full_name = f"{model_prefix}.{layer_idx}.{tmeta['name']}"
             original = read_tensor(tensor_index, full_name)
-            f.seek(tmeta["offset"])
-            converted = np.frombuffer(
-                f.read(tmeta["size_bytes"]), dtype=np.float16
-            ).reshape(tmeta["shape"])
-            if not np.array_equal(original, converted):
-                print(f"  MISMATCH: {full_name}")
+            if not _verify_tensor(f, tmeta, original, full_name):
                 return False
     return True
 
@@ -297,12 +446,7 @@ def verify_special(
     with open(filepath, "rb") as f:
         for tmeta in file_meta["tensors"]:
             original = read_tensor(tensor_index, tmeta["name"])
-            f.seek(tmeta["offset"])
-            converted = np.frombuffer(
-                f.read(tmeta["size_bytes"]), dtype=np.float16
-            ).reshape(tmeta["shape"])
-            if not np.array_equal(original, converted):
-                print(f"  MISMATCH: {tmeta['name']}")
+            if not _verify_tensor(f, tmeta, original, tmeta["name"]):
                 return False
     return True
 
@@ -325,6 +469,12 @@ def main():
         "--skip-verify",
         action="store_true",
         help="Skip verification step after conversion",
+    )
+    parser.add_argument(
+        "--quantize",
+        choices=["none", "int8"],
+        default="none",
+        help="Weight quantization method (default: none = fp16)",
     )
     args = parser.parse_args()
 
@@ -353,17 +503,23 @@ def main():
           f"num_heads={config['num_heads']}, "
           f"num_kv_heads={config['num_kv_heads']}")
 
+    quantize = args.quantize
+    if quantize != "none":
+        print(f"Quantization: {quantize}")
+
     # Step 3: Convert special files
     print("Converting embed_tokens...")
     embed_meta = convert_special(
         ["model.embed_tokens.weight"],
         tensor_index, "embed_tokens.bin", args.output_dir,
+        quantize=quantize,
     )
 
     print("Converting final_norm...")
     norm_meta = convert_special(
         ["model.norm.weight"],
         tensor_index, "final_norm.bin", args.output_dir,
+        quantize=quantize, force_fp16=True,  # norms stay fp16
     )
 
     # lm_head: some models tie lm_head to embed_tokens
@@ -372,6 +528,7 @@ def main():
         lm_head_meta = convert_special(
             ["lm_head.weight"],
             tensor_index, "lm_head.bin", args.output_dir,
+            quantize=quantize,
         )
         lm_head_tied = False
     else:
@@ -383,13 +540,17 @@ def main():
     layer_metas = []
     for i in range(config["num_layers"]):
         print(f"Converting layer {i}/{config['num_layers'] - 1}...")
-        layer_meta = convert_layer(i, tensor_index, args.output_dir)
+        layer_meta = convert_layer(
+            i, tensor_index, args.output_dir, quantize=quantize,
+        )
         layer_metas.append(layer_meta)
 
     # Step 5: Write metadata.json
+    dtype_label = "int8" if quantize == "int8" else "float16"
     metadata = {
         "model": "llama",
-        "dtype": "float16",
+        "dtype": dtype_label,
+        "quantization": quantize,
         "alignment": ALIGNMENT,
         **config,
         "lm_head_tied": lm_head_tied,
@@ -406,7 +567,21 @@ def main():
         json.dump(metadata, f, indent=2)
     print(f"Wrote metadata to {metadata_path}")
 
-    # Step 6: Verify
+    # Step 6: Copy tokenizer files from source model directory
+    tokenizer_files = ["tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+                       "special_tokens_map.json"]
+    copied = 0
+    for tf in tokenizer_files:
+        src = os.path.join(args.model_dir, tf)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(args.output_dir, tf))
+            copied += 1
+    if copied:
+        print(f"Copied {copied} tokenizer files to {args.output_dir}")
+    else:
+        print("Warning: no tokenizer files found in source model directory")
+
+    # Step 7: Verify
     if not args.skip_verify:
         print("Verifying converted files...")
         ok = True

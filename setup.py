@@ -11,6 +11,7 @@ setup(
             name="gdsllm.runtime.gds_io_ext",
             sources=[
                 "gdsllm/runtime/gds_io.cu",
+                "gdsllm/runtime/gguf_dequant.cu",
                 "gdsllm/runtime/gds_bindings.cpp",
             ],
             include_dirs=["/usr/local/cuda-12.8/include"],

@@ -7,6 +7,8 @@ operations. Operates on externally-provided weight tensors (no nn.Module).
 Supports both LLaMA-1 and LLaMA-2 (standard MHA and GQA).
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
@@ -22,14 +24,54 @@ def rms_norm(
     return (x * norm).to(input_dtype) * weight
 
 
+def _apply_llama3_rope_scaling(
+    freqs: torch.Tensor, rope_scaling: dict,
+) -> torch.Tensor:
+    """Apply Llama 3.x frequency-dependent RoPE scaling.
+
+    Low-frequency components (long wavelengths) get scaled down by `factor`,
+    high-frequency components (short wavelengths) are kept unchanged, and
+    mid-range frequencies are smoothly interpolated between the two.
+    """
+    factor = rope_scaling["factor"]
+    low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+    high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+    old_context_len = rope_scaling["original_max_position_embeddings"]
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+
+    new_freqs = []
+    for freq in freqs.tolist():
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)  # high freq: no scaling
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / factor)  # low freq: full scaling
+        else:
+            # smooth interpolation
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq / factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+
+
 def precompute_freqs_cis(
     head_dim: int, seq_len: int, theta: float = 10000.0,
-    device: torch.device = None,
+    device: torch.device = None, rope_scaling: Optional[dict] = None,
 ) -> torch.Tensor:
-    """Precompute the RoPE complex frequency tensor."""
+    """Precompute the RoPE complex frequency tensor.
+
+    Supports standard RoPE and Llama 3.x frequency-dependent scaling.
+    """
     freqs = 1.0 / (
         theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
     )
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", ""))
+        if rope_type in ("llama3", "llama3.1"):
+            freqs = _apply_llama3_rope_scaling(freqs, rope_scaling)
     t = torch.arange(seq_len, device=device)
     freqs = torch.outer(t, freqs)
     return torch.polar(torch.ones_like(freqs), freqs)
@@ -61,6 +103,39 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
+def _dequant_gguf(meta: dict) -> torch.Tensor:
+    """Dequantize a GGUF block-quantized tensor on GPU.
+
+    Args:
+        meta: dict with keys 'buffer', 'shape', 'gguf_type', 'offset'
+    Returns:
+        fp16 tensor
+    """
+    from gdsllm.runtime import gds_io_ext
+    return gds_io_ext.dequant_gguf(
+        meta["buffer"], meta["shape"], meta["gguf_type"], meta["offset"]
+    )
+
+
+def dequant_linear(
+    x: torch.Tensor, weights: Dict[str, torch.Tensor], name: str
+) -> torch.Tensor:
+    """F.linear with on-the-fly dequantization (INT8, GGUF Q4_0/Q8_0).
+
+    If the weight is a GGUF dict, dequantizes block data via CUDA kernel.
+    If the weight is int8, dequantizes using the per-channel scale before matmul.
+    If the weight is fp16, behaves like a normal F.linear.
+    """
+    w = weights[f"{name}.weight"]
+    if isinstance(w, dict) and "gguf_type" in w:
+        w = _dequant_gguf(w)
+    elif w.dtype == torch.int8:
+        scale = weights[f"{name}.scale"]
+        w = w.float() * scale  # broadcast [out, in] * [1, in]
+        w = w.half()
+    return F.linear(x, w)
+
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Repeat KV heads to match the number of query heads (for GQA).
 
@@ -82,25 +157,29 @@ def attention(
     mask: Optional[torch.Tensor],
     num_heads: int,
     num_kv_heads: int,
+    kv_cache=None,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
-    """Multi-head self-attention (supports GQA).
+    """Multi-head self-attention (supports GQA and optional KV cache).
 
     Args:
         x: (batch, seq_len, hidden_size)
         weights: dict with q_proj.weight, k_proj.weight, v_proj.weight, o_proj.weight
         freqs_cis: (seq_len, head_dim // 2) complex
-        mask: (1, 1, seq_len, seq_len) or None
+        mask: (1, 1, seq_len, total_len) or None
         num_heads: number of query heads
         num_kv_heads: number of KV heads
+        kv_cache: optional KVCache instance for incremental decoding
+        layer_idx: transformer layer index (used with kv_cache)
     """
     batch, seq_len, hidden_size = x.shape
     head_dim = hidden_size // num_heads
     n_rep = num_heads // num_kv_heads
 
     # Project Q, K, V
-    xq = F.linear(x, weights["self_attn.q_proj.weight"])
-    xk = F.linear(x, weights["self_attn.k_proj.weight"])
-    xv = F.linear(x, weights["self_attn.v_proj.weight"])
+    xq = dequant_linear(x, weights, "self_attn.q_proj")
+    xk = dequant_linear(x, weights, "self_attn.k_proj")
+    xv = dequant_linear(x, weights, "self_attn.v_proj")
 
     # Reshape for multi-head: (batch, seq, num_heads, head_dim)
     xq = xq.view(batch, seq_len, num_heads, head_dim)
@@ -115,6 +194,10 @@ def attention(
     xk = xk.transpose(1, 2)
     xv = xv.transpose(1, 2)
 
+    # KV cache: store current K/V and retrieve full history
+    if kv_cache is not None:
+        xk, xv = kv_cache.update(layer_idx, xk, xv)
+
     # Repeat KV for GQA
     xk = repeat_kv(xk, n_rep)
     xv = repeat_kv(xv, n_rep)
@@ -128,14 +211,14 @@ def attention(
 
     # Reshape and project output
     output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-    return F.linear(output, weights["self_attn.o_proj.weight"])
+    return dequant_linear(output, weights, "self_attn.o_proj")
 
 
 def mlp(x: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
     """SwiGLU MLP as used in LLaMA."""
-    gate = F.linear(x, weights["mlp.gate_proj.weight"])
-    up = F.linear(x, weights["mlp.up_proj.weight"])
-    return F.linear(F.silu(gate) * up, weights["mlp.down_proj.weight"])
+    gate = dequant_linear(x, weights, "mlp.gate_proj")
+    up = dequant_linear(x, weights, "mlp.up_proj")
+    return dequant_linear(F.silu(gate) * up, weights, "mlp.down_proj")
 
 
 def transformer_block(
@@ -146,11 +229,16 @@ def transformer_block(
     num_heads: int,
     num_kv_heads: int,
     rms_norm_eps: float = 1e-5,
+    kv_cache=None,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """One transformer layer (pre-norm architecture)."""
     # Self-attention with residual
     h = rms_norm(x, weights["input_layernorm.weight"], rms_norm_eps)
-    h = attention(h, weights, freqs_cis, mask, num_heads, num_kv_heads)
+    h = attention(
+        h, weights, freqs_cis, mask, num_heads, num_kv_heads,
+        kv_cache=kv_cache, layer_idx=layer_idx,
+    )
     x = x + h
 
     # MLP with residual

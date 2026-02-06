@@ -6,12 +6,15 @@
  */
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+#include "gguf_dequant.h"
 
 namespace py = pybind11;
 
@@ -181,6 +184,58 @@ static torch::Tensor py_load_tensor(
     return tensor;
 }
 
+/**
+ * Dequantize GGUF block-quantized data from a GDS buffer into an fp16 tensor.
+ *
+ * Reads raw block data at `offset` within the buffer, runs the appropriate
+ * CUDA dequant kernel (Q4_0 or Q8_0), and returns a new fp16 tensor.
+ */
+static torch::Tensor py_dequant_gguf(
+    std::shared_ptr<GdsBufferHandle> handle,
+    std::vector<int64_t> shape,
+    const std::string& gguf_type,
+    int64_t offset
+) {
+    if (!handle || !handle->dev_ptr()) {
+        throw std::runtime_error("py_dequant_gguf: invalid buffer handle");
+    }
+
+    // Compute total number of elements from shape
+    int64_t num_elements = 1;
+    for (auto s : shape) num_elements *= s;
+
+    if (num_elements % 32 != 0) {
+        throw std::runtime_error(
+            "py_dequant_gguf: total elements must be a multiple of 32 (block size), got " +
+            std::to_string(num_elements));
+    }
+    size_t num_blocks = num_elements / 32;
+
+    // Source pointer in the GDS buffer
+    const void* src = static_cast<const char*>(handle->dev_ptr()) + offset;
+
+    // Allocate output fp16 tensor
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat16)
+        .device(torch::kCUDA, handle->device_id());
+    torch::Tensor output = torch::empty(shape, options);
+
+    __half* dst = reinterpret_cast<__half*>(output.data_ptr());
+
+    // Get current CUDA stream from PyTorch
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(handle->device_id());
+
+    if (gguf_type == "q8_0") {
+        launch_dequant_q8_0(src, dst, num_blocks, stream);
+    } else if (gguf_type == "q4_0") {
+        launch_dequant_q4_0(src, dst, num_blocks, stream);
+    } else {
+        throw std::runtime_error("py_dequant_gguf: unsupported type '" + gguf_type + "'");
+    }
+
+    return output;
+}
+
 // ─── Module definition ────────────────────────────────────────────────────
 
 PYBIND11_MODULE(gds_io_ext, m) {
@@ -227,4 +282,12 @@ PYBIND11_MODULE(gds_io_ext, m) {
           py::arg("file_offset") = 0,
           py::arg("size_bytes") = 0,
           py::arg("device_id") = 0);
+
+    // GGUF block dequantization
+    m.def("dequant_gguf", &py_dequant_gguf,
+          "Dequantize GGUF block-quantized data (Q4_0/Q8_0) from a buffer to fp16.",
+          py::arg("handle"),
+          py::arg("shape"),
+          py::arg("gguf_type"),
+          py::arg("offset"));
 }
