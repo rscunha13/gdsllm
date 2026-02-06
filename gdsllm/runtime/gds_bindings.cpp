@@ -15,6 +15,7 @@
 #include <string>
 
 #include "gguf_dequant.h"
+#include "fused_gemv.h"
 
 namespace py = pybind11;
 
@@ -251,6 +252,79 @@ static torch::Tensor py_dequant_gguf(
     return output;
 }
 
+/**
+ * Fused dequant + matrix-vector multiply for decode (batch=1, seq_len=1).
+ *
+ * Reads Q4_0/Q8_0 blocks directly from the GDS buffer and computes the
+ * dot product with the input vector in a single kernel, avoiding the
+ * fp16 intermediate allocation entirely.
+ *
+ * Args:
+ *   handle: GDS buffer containing the quantized weight data
+ *   x: input tensor [1, in_dim] or [in_dim] fp16
+ *   weight_shape: [out_dim, in_dim] shape of the weight matrix
+ *   gguf_type: "q4_0" or "q8_0"
+ *   offset: byte offset of the weight data within the buffer
+ *
+ * Returns:
+ *   output tensor [1, out_dim] fp16
+ */
+static torch::Tensor py_fused_dequant_gemv(
+    std::shared_ptr<GdsBufferHandle> handle,
+    torch::Tensor x,
+    std::vector<int64_t> weight_shape,
+    const std::string& gguf_type,
+    int64_t offset
+) {
+    if (!handle || !handle->dev_ptr()) {
+        throw std::runtime_error("py_fused_dequant_gemv: invalid buffer handle");
+    }
+    if (weight_shape.size() != 2) {
+        throw std::runtime_error("py_fused_dequant_gemv: weight_shape must be [out_dim, in_dim]");
+    }
+
+    int out_dim = weight_shape[0];
+    int in_dim = weight_shape[1];
+
+    if (in_dim % 32 != 0) {
+        throw std::runtime_error(
+            "py_fused_dequant_gemv: in_dim must be a multiple of 32, got " +
+            std::to_string(in_dim));
+    }
+
+    // Flatten input to [in_dim]
+    torch::Tensor x_flat = x.contiguous().view({-1});
+    if (x_flat.size(0) != in_dim) {
+        throw std::runtime_error(
+            "py_fused_dequant_gemv: input size " + std::to_string(x_flat.size(0)) +
+            " != in_dim " + std::to_string(in_dim));
+    }
+
+    // Weight data pointer
+    const void* weight_ptr = static_cast<const char*>(handle->dev_ptr()) + offset;
+
+    // Allocate output [1, out_dim]
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat16)
+        .device(torch::kCUDA, handle->device_id());
+    torch::Tensor output = torch::empty({1, out_dim}, options);
+
+    const __half* x_ptr = reinterpret_cast<const __half*>(x_flat.data_ptr());
+    __half* y_ptr = reinterpret_cast<__half*>(output.data_ptr());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(handle->device_id());
+
+    if (gguf_type == "q4_0") {
+        launch_fused_q4_0_gemv(weight_ptr, x_ptr, y_ptr, out_dim, in_dim, stream);
+    } else if (gguf_type == "q8_0") {
+        launch_fused_q8_0_gemv(weight_ptr, x_ptr, y_ptr, out_dim, in_dim, stream);
+    } else {
+        throw std::runtime_error("py_fused_dequant_gemv: unsupported type '" + gguf_type + "'");
+    }
+
+    return output;
+}
+
 // ─── Module definition ────────────────────────────────────────────────────
 
 PYBIND11_MODULE(gds_io_ext, m) {
@@ -306,4 +380,13 @@ PYBIND11_MODULE(gds_io_ext, m) {
           py::arg("gguf_type"),
           py::arg("offset"),
           py::arg("output") = py::none());
+
+    // Fused dequant + GEMV (decode path)
+    m.def("fused_dequant_gemv", &py_fused_dequant_gemv,
+          "Fused dequant + matrix-vector multiply for Q4_0/Q8_0 (decode only).",
+          py::arg("handle"),
+          py::arg("x"),
+          py::arg("weight_shape"),
+          py::arg("gguf_type"),
+          py::arg("offset"));
 }

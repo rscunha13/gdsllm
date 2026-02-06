@@ -119,18 +119,45 @@ def _dequant_gguf(meta: dict, scratch: Optional[torch.Tensor] = None) -> torch.T
     )
 
 
+def _fused_dequant_gemv(x: torch.Tensor, meta: dict) -> torch.Tensor:
+    """Fused dequant + GEMV for decode (single token).
+
+    Dequantizes Q4_0/Q8_0 blocks and computes the dot product with x
+    in a single kernel, avoiding the fp16 intermediate entirely.
+
+    Args:
+        x: (batch, 1, in_dim) fp16 input
+        meta: dict with keys 'buffer', 'shape', 'gguf_type', 'offset'
+    Returns:
+        (batch, 1, out_dim) fp16 output
+    """
+    from gdsllm.runtime import gds_io_ext
+    # x is [1, 1, in_dim] — squeeze to [1, in_dim] for the C++ binding
+    out = gds_io_ext.fused_dequant_gemv(
+        meta["buffer"], x.view(-1),
+        meta["shape"], meta["gguf_type"], meta["offset"],
+    )
+    # out is [1, out_dim] — reshape to [1, 1, out_dim]
+    return out.unsqueeze(0)
+
+
 def dequant_linear(
     x: torch.Tensor, weights: Dict[str, torch.Tensor], name: str,
     scratch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """F.linear with on-the-fly dequantization (INT8, GGUF Q4_0/Q8_0).
 
-    If the weight is a GGUF dict, dequantizes block data via CUDA kernel.
-    If the weight is int8, dequantizes using the per-channel scale before matmul.
-    If the weight is fp16, behaves like a normal F.linear.
+    For GGUF decode (seq_len=1), uses fused dequant+GEMV kernel.
+    For GGUF prefill (seq_len>1), dequants to fp16 then uses cuBLAS GEMM.
+    For INT8, dequantizes using the per-channel scale before matmul.
+    For fp16, behaves like a normal F.linear.
     """
     w = weights[f"{name}.weight"]
     if isinstance(w, dict) and "gguf_type" in w:
+        # Fused path: single-token decode → dequant+GEMV in one kernel
+        if x.shape[1] == 1:
+            return _fused_dequant_gemv(x, w)
+        # Prefill path: separate dequant + cuBLAS GEMM
         w = _dequant_gguf(w, scratch)
     elif w.dtype == torch.int8:
         scale = weights[f"{name}.scale"]

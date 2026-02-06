@@ -90,22 +90,52 @@ main thread). Tested: 6.432s/tok vs 6.356s baseline — no measurable benefit.
 The synchronous case effectively already achieves double-buffering at the hardware level.
 Explicit async prefetch adds thread overhead for no benefit. **Reverted.**
 
-### Phase 3: Fused dequant+GEMM (Bottleneck #1) — TODO
+### Phase 3: Fused dequant+GEMV (Bottleneck #1) — NO IMPROVEMENT
 
-This remains the primary bottleneck. The two-kernel pattern (dequant → fp16 temp → matmul)
-forces the GPU to fully complete the dequant before starting the matmul, with no
-opportunity for pipelining. A fused kernel would stream blocks, dequantize to registers,
-and feed directly into the GEMM, eliminating the fp16 intermediate entirely.
+Implemented fused Q4_0 dequant+GEMV kernel: dequantizes blocks directly into dot-product
+accumulators in registers, never materializing the fp16 intermediate. Reduces VRAM
+bandwidth from ~2.8 GB/layer (write+read fp16) to ~0.35 GB/layer (read Q4_0 only) — 8x.
+
+**Result: 6.465s/tok vs 6.36s baseline — no measurable benefit.**
+
+**Why it doesn't help:** The GPU work is completely hidden behind NVMe I/O:
+- NVMe read: 520 MB/layer × 73 layers / 7 GB/s = **5.4s** (dominates)
+- Old GPU path (dequant+matmul): 2.8 GB × 73 / 717 GB/s = **0.29s** (hidden)
+- Fused GPU path: 0.35 GB × 73 / 717 GB/s = **0.035s** (still hidden)
+
+The GPU finishes each layer in ~4ms then waits ~70ms for the next NVMe read.
+Making GPU work 8x faster just means it waits 66ms instead of 63ms.
+
+**Code kept:** the fused kernel will matter when more layers are VRAM-cached (e.g.,
+on a 24 GB GPU where 20+ layers fit), making the system GPU-bound instead of I/O-bound.
+
+## The Real Bottleneck: NVMe Bandwidth
+
+With 73 of 80 layers streamed from NVMe at 7 GB/s, the system is **NVMe-bandwidth-bound**.
+All GPU-side optimizations (scratch buffer, fused kernel, double-buffering) are limited
+because the GPU spends >90% of decode time idle, waiting for the next layer from NVMe.
+
+**Breakdown of 6.4s decode:**
+- NVMe reads (73 uncached layers): ~5.4s (84%)
+- Cached layers compute (7 layers): ~0.6s (9%)
+- Embed/norm/lm_head + overhead: ~0.4s (7%)
+
+**Paths to further improvement:**
+1. **More VRAM** — 24 GB GPU caches ~20 layers, 48 GB caches ~45 layers
+2. **Faster NVMe** — Gen5 x4 (~14 GB/s) would halve I/O time
+3. **Multiple NVMe** — RAID-0 across drives
+4. **Smaller quant** — Q2_K halves weight data again (but may hurt quality)
+5. **CPU RAM cache** — Stage layers in system RAM (50+ GB/s) before VRAM
 
 ## Summary (ranked by impact)
 
-| Bottleneck | Est. GPU idle | Fix | Status |
+| Bottleneck | Est. impact | Fix | Status |
 |---|---|---|---|
-| Dequant→matmul two-phase | ~15-20% | Fused dequant+GEMM kernel | TODO |
-| ~~Synchronous NVMe I/O~~ | ~~10%~~ | ~~Double-buffering~~ | **Not a bottleneck** |
+| **NVMe bandwidth (7 GB/s)** | **~84% of decode** | **More VRAM / faster NVMe** | **Hard limit** |
+| ~~Dequant→matmul two-phase~~ | ~~15-20%~~ | ~~Fused dequant+GEMV~~ | **GPU already idle** |
+| ~~Synchronous NVMe I/O~~ | ~~10%~~ | ~~Double-buffering~~ | **Natural overlap** |
 | ~~Per-call fp16 allocation~~ | ~~3-5%~~ | ~~Reusable scratch buffer~~ | **Done: -17%** |
-| Dequant kernel efficiency | ~2-3% | Warp-level, coalesced writes | TODO |
-| Python→C++ roundtrips | ~1-2% | Batch dequant per layer | TODO |
 
-Current decode: **6.36s/tok** (from 7.69s baseline). Remaining ~83% of decode time is
-dominated by the dequant→matmul serialization pattern (Bottleneck #1).
+Current decode: **6.36s/tok** (from 7.69s baseline). The only Phase 1.1 scratch buffer
+optimization had measurable impact because it eliminated CUDA allocator jitter. All
+other GPU optimizations are masked by the 5.4s NVMe read bottleneck.
