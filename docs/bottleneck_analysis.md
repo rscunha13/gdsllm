@@ -90,24 +90,28 @@ main thread). Tested: 6.432s/tok vs 6.356s baseline — no measurable benefit.
 The synchronous case effectively already achieves double-buffering at the hardware level.
 Explicit async prefetch adds thread overhead for no benefit. **Reverted.**
 
-### Phase 3: Fused dequant+GEMV (Bottleneck #1) — NO IMPROVEMENT
+### Phase 3: Fused dequant+GEMV (Bottleneck #1) — 10x when GPU-bound
 
 Implemented fused Q4_0 dequant+GEMV kernel: dequantizes blocks directly into dot-product
 accumulators in registers, never materializing the fp16 intermediate. Reduces VRAM
 bandwidth from ~2.8 GB/layer (write+read fp16) to ~0.35 GB/layer (read Q4_0 only) — 8x.
 
-**Result: 6.465s/tok vs 6.36s baseline — no measurable benefit.**
-
-**Why it doesn't help:** The GPU work is completely hidden behind NVMe I/O:
+**70B Q4_0 (73/80 layers streamed from NVMe): 6.465s/tok — no improvement.**
+The GPU work is completely hidden behind NVMe I/O:
 - NVMe read: 520 MB/layer × 73 layers / 7 GB/s = **5.4s** (dominates)
 - Old GPU path (dequant+matmul): 2.8 GB × 73 / 717 GB/s = **0.29s** (hidden)
 - Fused GPU path: 0.35 GB × 73 / 717 GB/s = **0.035s** (still hidden)
 
-The GPU finishes each layer in ~4ms then waits ~70ms for the next NVMe read.
-Making GPU work 8x faster just means it waits 66ms instead of 63ms.
+**7B Q4_0 (32/32 layers cached in VRAM): 10x faster decode.**
 
-**Code kept:** the fused kernel will matter when more layers are VRAM-cached (e.g.,
-on a 24 GB GPU where 20+ layers fit), making the system GPU-bound instead of I/O-bound.
+| Path | Decode/tok | Tok/s |
+|------|-----------|-------|
+| Separate dequant + cuBLAS | 166 ms | 6.0 tok/s |
+| **Fused dequant+GEMV** | **17 ms** | **59.3 tok/s** |
+
+When all layers fit in VRAM the system is GPU-bound, and eliminating the fp16
+intermediate write+read delivers the full 8-10x bandwidth reduction. The fused
+kernel matters proportionally to how many layers are cached.
 
 ## The Real Bottleneck: NVMe Bandwidth
 
@@ -129,13 +133,12 @@ because the GPU spends >90% of decode time idle, waiting for the next layer from
 
 ## Summary (ranked by impact)
 
-| Bottleneck | Est. impact | Fix | Status |
+| Bottleneck | Fix | 70B (NVMe-bound) | 7B (GPU-bound) |
 |---|---|---|---|
-| **NVMe bandwidth (7 GB/s)** | **~84% of decode** | **More VRAM / faster NVMe** | **Hard limit** |
-| ~~Dequant→matmul two-phase~~ | ~~15-20%~~ | ~~Fused dequant+GEMV~~ | **GPU already idle** |
-| ~~Synchronous NVMe I/O~~ | ~~10%~~ | ~~Double-buffering~~ | **Natural overlap** |
-| ~~Per-call fp16 allocation~~ | ~~3-5%~~ | ~~Reusable scratch buffer~~ | **Done: -17%** |
+| **NVMe bandwidth** | More VRAM / faster NVMe | **Hard limit (84%)** | N/A (all cached) |
+| Dequant→matmul two-phase | Fused dequant+GEMV | No effect (GPU idle) | **10x faster** |
+| Synchronous NVMe I/O | Double-buffering | No effect (natural overlap) | N/A |
+| Per-call fp16 allocation | Reusable scratch buffer | **-17%** | Superseded by fused |
 
-Current decode: **6.36s/tok** (from 7.69s baseline). The only Phase 1.1 scratch buffer
-optimization had measurable impact because it eliminated CUDA allocator jitter. All
-other GPU optimizations are masked by the 5.4s NVMe read bottleneck.
+**70B decode: 6.36s/tok** (from 7.69s baseline) — NVMe-bound, only scratch buffer helped.
+**7B decode: 17ms/tok (59 tok/s)** — GPU-bound, fused kernel delivers full 10x speedup.
