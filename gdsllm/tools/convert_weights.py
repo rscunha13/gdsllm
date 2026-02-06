@@ -6,7 +6,11 @@ tensors concatenated in a fixed order, with 4KB alignment padding.
 
 Also produces embed_tokens.bin, final_norm.bin, lm_head.bin, and metadata.json.
 
+Environment variables:
+    GDSLLM_MODEL_ROOT  — Default output directory (used if --output-dir not given)
+
 Usage:
+    export GDSLLM_MODEL_ROOT="/mnt/SSD2TB/gdsllm_model"
     python -m gdsllm.tools.convert_weights \
         --model-dir /path/to/llama-2-7b-hf \
         --output-dir /path/to/gdsllm/model
@@ -462,8 +466,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Output directory for converted .bin files and metadata.json",
+        default=os.environ.get("GDSLLM_MODEL_ROOT"),
+        help="Output directory for converted .bin files and metadata.json (default: GDSLLM_MODEL_ROOT env var)",
     )
     parser.add_argument(
         "--skip-verify",
@@ -477,6 +481,12 @@ def main():
         help="Weight quantization method (default: none = fp16)",
     )
     args = parser.parse_args()
+
+    # Validate output dir
+    if not args.output_dir:
+        print("Error: No output directory specified.\n"
+              "Pass --output-dir or set GDSLLM_MODEL_ROOT env var.")
+        sys.exit(1)
 
     # Validate input
     if not os.path.isdir(args.model_dir):

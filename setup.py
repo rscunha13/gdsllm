@@ -26,4 +26,14 @@ setup(
     ],
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",
+    install_requires=[
+        "fastapi",
+        "uvicorn[standard]",
+        "transformers",
+    ],
+    entry_points={
+        "console_scripts": [
+            "gdsllm=gdsllm.cli:main",
+        ],
+    },
 )

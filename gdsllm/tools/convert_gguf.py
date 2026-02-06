@@ -4,7 +4,11 @@ Convert a GGUF model file to GdsLLM per-layer binary format.
 Keeps block-quantized data as-is (Q4_0, Q8_0) for GPU dequantization.
 Norm tensors (f32 in GGUF) are converted to f16.
 
+Environment variables:
+    GDSLLM_MODEL_ROOT  — Default output directory (used if --output-dir not given)
+
 Usage:
+    export GDSLLM_MODEL_ROOT="/mnt/SSD2TB/gdsllm_model"
     python -m gdsllm.tools.convert_gguf \
         --gguf /path/to/model.gguf \
         --output-dir /path/to/gdsllm_model
@@ -481,10 +485,15 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Output directory for converted .bin files and metadata.json",
+        default=os.environ.get("GDSLLM_MODEL_ROOT"),
+        help="Output directory for converted .bin files and metadata.json (default: GDSLLM_MODEL_ROOT env var)",
     )
     args = parser.parse_args()
+
+    if not args.output_dir:
+        print("Error: No output directory specified.\n"
+              "Pass --output-dir or set GDSLLM_MODEL_ROOT env var.")
+        sys.exit(1)
 
     if not os.path.isfile(args.gguf):
         print(f"Error: GGUF file not found: {args.gguf}")

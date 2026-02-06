@@ -4,11 +4,15 @@ Download a LLaMA model from HuggingFace Hub.
 Authenticates via HUGGINGFACE_HUB_TOKEN environment variable.
 Downloads only the safetensors weights, tokenizer, and config.
 
+Environment variables:
+    GDSLLM_HF_CACHE     — Default download directory (used if --output-dir not given)
+    GDSLLM_MODEL_ROOT   — Default output directory for convert tools
+    HUGGINGFACE_HUB_TOKEN — HuggingFace authentication token
+
 Usage:
-    export HUGGINGFACE_HUB_TOKEN="hf_..."
-    python -m gdsllm.tools.download_model \
-        --model meta-llama/Llama-2-7b-hf \
-        --output-dir /mnt/SSD2TB/AIModels/llama-2-7b-hf
+    export GDSLLM_HF_CACHE="/mnt/SSD2TB/hf_models"
+    export GDSLLM_MODEL_ROOT="/mnt/SSD2TB/gdsllm_model"
+    python -m gdsllm.tools.download_model --model meta-llama/Llama-2-7b-hf
 """
 
 import argparse
@@ -53,8 +57,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Local directory to save the model",
+        default=os.environ.get("GDSLLM_HF_CACHE"),
+        help="Local directory to save the model (default: GDSLLM_HF_CACHE env var)",
     )
     parser.add_argument(
         "--token",
@@ -62,6 +66,14 @@ def main():
         help="HuggingFace token (default: reads from .env or HUGGINGFACE_HUB_TOKEN env var)",
     )
     args = parser.parse_args()
+
+    if not args.output_dir:
+        print(
+            "Error: No output directory specified.\n"
+            "Pass --output-dir or set GDSLLM_HF_CACHE env var.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     token = args.token or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     if not token:
@@ -108,10 +120,11 @@ def main():
             print(f"  {rel:50s} {size / (1024**2):8.1f} MB")
 
     print(f"\nTotal: {total_size / (1024**3):.2f} GB")
+    model_root = os.environ.get("GDSLLM_MODEL_ROOT", "<output-dir>")
     print(f"\nNext step: convert weights with:")
     print(f"  python -m gdsllm.tools.convert_weights \\")
     print(f"      --model-dir {path} \\")
-    print(f"      --output-dir /mnt/SSD2TB/gdsllm_model")
+    print(f"      --output-dir {model_root}")
 
 
 if __name__ == "__main__":
