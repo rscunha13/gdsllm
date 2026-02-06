@@ -100,7 +100,9 @@ setup(
     description="LLM inference runtime with NVMe-to-VRAM weight streaming via GPUDirect Storage",
     long_description=open("README.md").read() if os.path.isfile("README.md") else "",
     long_description_content_type="text/markdown",
+    author="Rodrigo Cunha",
     url="https://github.com/rscunha13/gdsllm",
+    license="MIT",
     packages=find_packages(),
     ext_modules=[
         CUDAExtension(
