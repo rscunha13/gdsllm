@@ -10,9 +10,12 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import hmac
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from gdsllm.engine import InferenceEngine
 
@@ -55,6 +58,33 @@ async def lifespan(app: FastAPI):
         engine = None
 
 
+_AUTH_EXEMPT = {"/", "/docs", "/redoc", "/openapi.json"}
+
+
+class BearerTokenMiddleware(BaseHTTPMiddleware):
+    """Validates Authorization: Bearer <token> on API requests."""
+
+    def __init__(self, app, api_token: str):
+        super().__init__(app)
+        self.api_token = api_token
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _AUTH_EXEMPT:
+            return await call_next(request)
+
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            logger.warning("Auth failed: missing Bearer token from %s", request.client.host)
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+        token = auth[7:]
+        if not hmac.compare_digest(token, self.api_token):
+            logger.warning("Auth failed: invalid token from %s", request.client.host)
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+        return await call_next(request)
+
+
 def create_app(
     model_dir: str | None = None,
     preload: bool = True,
@@ -80,6 +110,15 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Bearer token auth (optional — disabled when GDSLLM_API_TOKEN is unset)
+    api_token = os.environ.get("GDSLLM_API_TOKEN", "").strip()
+    if api_token:
+        app.state.api_token = api_token
+        app.add_middleware(BearerTokenMiddleware, api_token=api_token)
+        logger.info("API authentication enabled (Bearer token)")
+    else:
+        app.state.api_token = ""
 
     # Import and include routers
     from gdsllm.server.routes_api import router as api_router

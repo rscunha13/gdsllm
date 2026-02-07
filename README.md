@@ -66,7 +66,7 @@ gdsllm list
 gdsllm run Llama-2-7b-hf
 
 # Start API server (Ollama + OpenAI compatible)
-gdsllm serve --model-dir Llama-2-7b-hf --preload
+gdsllm serve Llama-2-7b-hf --preload
 ```
 
 ## CLI Reference
@@ -75,7 +75,7 @@ gdsllm serve --model-dir Llama-2-7b-hf --preload
 |---------|-------------|
 | `gdsllm pull <model>` | Download HF model and convert to GdsLLM format |
 | `gdsllm run <model>` | Interactive chat in terminal |
-| `gdsllm serve` | Start the API server |
+| `gdsllm serve <model>` | Start the API server |
 | `gdsllm stop` | Stop the running server |
 | `gdsllm list` | List available local models |
 | `gdsllm show <model>` | Show model details |
@@ -120,8 +120,26 @@ print(response.choices[0].message.content)
 | `GDSLLM_MODEL_ROOT` | Root directory for converted GdsLLM models |
 | `GDSLLM_HF_CACHE` | Directory for HuggingFace model downloads |
 | `HUGGINGFACE_HUB_TOKEN` | HuggingFace authentication token |
+| `GDSLLM_API_TOKEN` | API bearer token (optional — no auth if unset) |
 
 Set these in a `.env` file in the project root (see `.env.example`), or export them in your shell.
+
+## Authentication
+
+API authentication is optional. Set `GDSLLM_API_TOKEN` to enable bearer token auth:
+
+```bash
+export GDSLLM_API_TOKEN=your-secret-token
+gdsllm serve Llama-3.3-70B-Instruct-Q4_0
+```
+
+Then include the token in requests:
+
+```bash
+curl -H "Authorization: Bearer your-secret-token" http://localhost:8000/api/tags
+```
+
+If `GDSLLM_API_TOKEN` is not set, the server runs with open access (no auth required).
 
 ## Architecture
 

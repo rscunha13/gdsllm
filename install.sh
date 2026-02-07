@@ -183,6 +183,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
     read -rp "  Model storage directory (NVMe path for converted models): " MODEL_ROOT
     read -rp "  HuggingFace cache directory (for downloads): " HF_CACHE
     read -rp "  HuggingFace token (from https://huggingface.co/settings/tokens): " HF_TOKEN
+    read -rp "  API token (optional — leave empty for open access): " API_TOKEN
 
     MODEL_ROOT="${MODEL_ROOT:-$HOME/gdsllm_models}"
     HF_CACHE="${HF_CACHE:-$HOME/hf_cache}"
@@ -191,6 +192,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 GDSLLM_MODEL_ROOT=$MODEL_ROOT
 GDSLLM_HF_CACHE=$HF_CACHE
+GDSLLM_API_TOKEN=$API_TOKEN
 EOF
 
     # Create directories
@@ -219,5 +221,5 @@ echo "  Quick start:"
 echo "    gdsllm pull meta-llama/Llama-2-7b-hf    # Download & convert a model"
 echo "    gdsllm list                              # List local models"
 echo "    gdsllm run Llama-2-7b-hf                 # Chat in terminal"
-echo "    gdsllm serve --model-dir Llama-2-7b-hf   # Start API server"
+echo "    gdsllm serve Llama-2-7b-hf               # Start API server"
 echo ""

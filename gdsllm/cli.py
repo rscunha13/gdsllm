@@ -123,15 +123,7 @@ def cmd_serve(args):
     import uvicorn
     from gdsllm.server.app import create_app
 
-    model_dir = args.model_dir or os.environ.get("GDSLLM_MODEL_DIR", "")
-    if not model_dir:
-        print(
-            "Error: --model-dir is required (or set GDSLLM_MODEL_DIR)",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    model_dir = _resolve_model_dir(model_dir)
+    model_dir = _resolve_model_dir(args.model_dir)
     if not os.path.isdir(model_dir):
         print(f"Error: Model directory not found: {model_dir}", file=sys.stderr)
         sys.exit(1)
@@ -149,10 +141,13 @@ def cmd_serve(args):
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
+    auth_enabled = bool(os.environ.get("GDSLLM_API_TOKEN", "").strip())
+
     print(f"Starting GdsLLM server on {args.host}:{args.port}")
     print(f"Model: {model_dir}")
     print(f"Model root: {model_root or '(not set)'}")
     print(f"Preload: {args.preload}")
+    print(f"Auth: {'enabled (Bearer token)' if auth_enabled else 'disabled (open access)'}")
     print()
     print(f"API docs: http://{args.host}:{args.port}/docs")
     print(f"Ollama API: http://{args.host}:{args.port}/api/")
@@ -634,7 +629,7 @@ def main():
     # serve
     p_serve = subparsers.add_parser("serve", help="Start the API server")
     p_serve.add_argument(
-        "--model-dir", default=None,
+        "model_dir",
         help="Model name or path (resolved against GDSLLM_MODEL_ROOT)",
     )
     p_serve.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
