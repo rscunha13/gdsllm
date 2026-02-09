@@ -25,6 +25,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sampling_params(options: schemas.Options | None) -> dict:
+    """Extract sampling parameters from Ollama-style Options."""
+    sp = {"max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "top_k": 0, "repeat_penalty": 1.0}
+    if options:
+        if options.max_tokens is not None:
+            sp["max_tokens"] = options.max_tokens
+        if options.temperature is not None:
+            sp["temperature"] = options.temperature
+        if options.top_p is not None:
+            sp["top_p"] = options.top_p
+        if options.top_k is not None:
+            sp["top_k"] = options.top_k
+        if options.repeat_penalty is not None:
+            sp["repeat_penalty"] = options.repeat_penalty
+    return sp
+
+
 def _scan_models(model_root: str) -> list[schemas.ModelInfo]:
     """Scan a directory for GdsLLM model subdirectories (containing metadata.json)."""
     models = []
@@ -83,30 +100,24 @@ async def api_generate(req: schemas.GenerateRequest):
     if engine is None:
         raise HTTPException(status_code=503, detail="No model loaded")
 
-    temperature = 0.0
-    max_tokens = 128
-    if req.options:
-        if req.options.temperature is not None:
-            temperature = req.options.temperature
-        if req.options.max_tokens is not None:
-            max_tokens = req.options.max_tokens
+    sp = _sampling_params(req.options)
 
     if req.stream:
         return StreamingResponse(
-            _stream_generate(req.prompt, max_tokens, temperature),
+            _stream_generate(req.prompt, **sp),
             media_type="application/x-ndjson",
         )
     else:
-        return await _generate_full(req.prompt, max_tokens, temperature)
+        return await _generate_full(req.prompt, **sp)
 
 
-async def _generate_full(prompt: str, max_tokens: int, temperature: float):
+async def _generate_full(prompt: str, **sp):
     """Non-streaming: collect all tokens, return single JSON response."""
     engine = get_engine()
     async with inference_lock:
         full_text = []
         final_event = None
-        for event in engine.generate(prompt, max_tokens, temperature, chat=False):
+        for event in engine.generate(prompt, **sp, chat=False):
             full_text.append(event.text)
             if event.done:
                 final_event = event
@@ -125,11 +136,11 @@ async def _generate_full(prompt: str, max_tokens: int, temperature: float):
         )
 
 
-async def _stream_generate(prompt: str, max_tokens: int, temperature: float):
+async def _stream_generate(prompt: str, **sp):
     """Streaming: yield NDJSON lines, one per token."""
     engine = get_engine()
     async with inference_lock:
-        for event in engine.generate(prompt, max_tokens, temperature, chat=False):
+        for event in engine.generate(prompt, **sp, chat=False):
             resp = schemas.GenerateResponse(
                 model=engine.model_name,
                 created_at=_now_iso(),
@@ -154,32 +165,25 @@ async def api_chat(req: schemas.ChatRequest):
     if engine is None:
         raise HTTPException(status_code=503, detail="No model loaded")
 
-    temperature = 0.0
-    max_tokens = 128
-    if req.options:
-        if req.options.temperature is not None:
-            temperature = req.options.temperature
-        if req.options.max_tokens is not None:
-            max_tokens = req.options.max_tokens
-
+    sp = _sampling_params(req.options)
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
     if req.stream:
         return StreamingResponse(
-            _stream_chat(messages, max_tokens, temperature),
+            _stream_chat(messages, **sp),
             media_type="application/x-ndjson",
         )
     else:
-        return await _chat_full(messages, max_tokens, temperature)
+        return await _chat_full(messages, **sp)
 
 
-async def _chat_full(messages: list[dict], max_tokens: int, temperature: float):
+async def _chat_full(messages: list[dict], **sp):
     """Non-streaming chat: collect all tokens, return single JSON."""
     engine = get_engine()
     async with inference_lock:
         full_text = []
         final_event = None
-        for event in engine.generate_chat(messages, max_tokens, temperature):
+        for event in engine.generate_chat(messages, **sp):
             full_text.append(event.text)
             if event.done:
                 final_event = event
@@ -199,11 +203,11 @@ async def _chat_full(messages: list[dict], max_tokens: int, temperature: float):
         )
 
 
-async def _stream_chat(messages: list[dict], max_tokens: int, temperature: float):
+async def _stream_chat(messages: list[dict], **sp):
     """Streaming chat: yield NDJSON lines, one per token."""
     engine = get_engine()
     async with inference_lock:
-        for event in engine.generate_chat(messages, max_tokens, temperature):
+        for event in engine.generate_chat(messages, **sp):
             resp = schemas.ChatResponse(
                 model=engine.model_name,
                 created_at=_now_iso(),

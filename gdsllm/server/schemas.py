@@ -22,7 +22,9 @@ class Message(BaseModel):
 class Options(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None
     max_tokens: Optional[int] = None
+    repeat_penalty: Optional[float] = None
 
 
 # ─── Ollama-style: /api/generate ──────────────────────────────────────────────
@@ -113,6 +115,9 @@ class OpenAIChatRequest(BaseModel):
     messages: list[Message]
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    repeat_penalty: Optional[float] = None
     stream: bool = False
 
 

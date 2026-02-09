@@ -32,27 +32,30 @@ async def openai_chat_completions(req: schemas.OpenAIChatRequest):
         raise HTTPException(status_code=503, detail="No model loaded")
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
-    max_tokens = req.max_tokens or 128
-    temperature = req.temperature if req.temperature is not None else 0.0
+    sp = {
+        "max_tokens": req.max_tokens or 128,
+        "temperature": req.temperature if req.temperature is not None else 0.0,
+        "top_p": req.top_p if req.top_p is not None else 1.0,
+        "top_k": req.top_k if req.top_k is not None else 0,
+        "repeat_penalty": req.repeat_penalty if req.repeat_penalty is not None else 1.0,
+    }
 
     if req.stream:
         return StreamingResponse(
-            _stream_openai_chat(messages, max_tokens, temperature),
+            _stream_openai_chat(messages, **sp),
             media_type="text/event-stream",
         )
     else:
-        return await _openai_chat_full(messages, max_tokens, temperature)
+        return await _openai_chat_full(messages, **sp)
 
 
-async def _openai_chat_full(
-    messages: list[dict], max_tokens: int, temperature: float,
-):
+async def _openai_chat_full(messages: list[dict], **sp):
     """Non-streaming: collect all tokens, return OpenAI-format JSON."""
     engine = get_engine()
     async with inference_lock:
         full_text = []
         final_event = None
-        for event in engine.generate_chat(messages, max_tokens, temperature):
+        for event in engine.generate_chat(messages, **sp):
             full_text.append(event.text)
             if event.done:
                 final_event = event
@@ -82,9 +85,7 @@ async def _openai_chat_full(
         )
 
 
-async def _stream_openai_chat(
-    messages: list[dict], max_tokens: int, temperature: float,
-):
+async def _stream_openai_chat(messages: list[dict], **sp):
     """Streaming: yield SSE events in OpenAI format."""
     engine = get_engine()
     chat_id = _gen_id()
@@ -106,7 +107,7 @@ async def _stream_openai_chat(
         yield f"data: {first_chunk.model_dump_json()}\n\n"
 
         # Content chunks
-        for event in engine.generate_chat(messages, max_tokens, temperature):
+        for event in engine.generate_chat(messages, **sp):
             if event.done:
                 chunk = schemas.OpenAIChatChunk(
                     id=chat_id,

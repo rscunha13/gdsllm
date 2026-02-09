@@ -40,12 +40,47 @@ class TokenEvent:
     total_duration_ns: int = 0
 
 
-def _sample(logits: torch.Tensor, temperature: float) -> int:
-    """Sample next token from logits."""
-    next_logits = logits[0, -1, :]
+def _sample(
+    logits: torch.Tensor,
+    temperature: float,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    repeat_penalty: float = 1.0,
+    input_ids: torch.Tensor | None = None,
+) -> int:
+    """Sample next token from logits with top-p, top-k, and repeat penalty."""
+    next_logits = logits[0, -1, :].clone()
+
+    # Repeat penalty: penalize tokens already in the context
+    if repeat_penalty != 1.0 and input_ids is not None:
+        seen = input_ids.view(-1).unique()
+        penalty_logits = next_logits[seen]
+        next_logits[seen] = torch.where(
+            penalty_logits > 0,
+            penalty_logits / repeat_penalty,
+            penalty_logits * repeat_penalty,
+        )
+
     if temperature <= 0:
         return next_logits.argmax().item()
-    probs = torch.softmax(next_logits / temperature, dim=-1)
+
+    next_logits = next_logits / temperature
+
+    # Top-k filtering
+    if top_k > 0:
+        top_k = min(top_k, next_logits.size(-1))
+        threshold = torch.topk(next_logits, top_k).values[-1]
+        next_logits[next_logits < threshold] = float("-inf")
+
+    # Top-p (nucleus) filtering
+    if 0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(next_logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        mask = cumulative_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
+        sorted_logits[mask] = float("-inf")
+        next_logits = sorted_logits.scatter(0, sorted_idx, sorted_logits)
+
+    probs = torch.softmax(next_logits, dim=-1)
     return torch.multinomial(probs, 1).item()
 
 
@@ -150,6 +185,9 @@ class InferenceEngine:
         prompt: str,
         max_tokens: int = 128,
         temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repeat_penalty: float = 1.0,
         chat: bool = True,
     ) -> Generator[TokenEvent, None, None]:
         """Generate tokens from a text prompt.
@@ -169,13 +207,16 @@ class InferenceEngine:
         else:
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
 
-        yield from self._generate_tokens(input_ids, max_tokens, temperature)
+        yield from self._generate_tokens(input_ids, max_tokens, temperature, top_p, top_k, repeat_penalty)
 
     def generate_chat(
         self,
         messages: list[dict],
         max_tokens: int = 128,
         temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repeat_penalty: float = 1.0,
     ) -> Generator[TokenEvent, None, None]:
         """Generate tokens from a chat message list.
 
@@ -197,13 +238,16 @@ class InferenceEngine:
             text += "\nassistant: "
             input_ids = self.tokenizer.encode(text, return_tensors="pt")
 
-        yield from self._generate_tokens(input_ids, max_tokens, temperature)
+        yield from self._generate_tokens(input_ids, max_tokens, temperature, top_p, top_k, repeat_penalty)
 
     def _generate_tokens(
         self,
         input_ids: torch.Tensor,
         max_tokens: int,
         temperature: float,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repeat_penalty: float = 1.0,
     ) -> Generator[TokenEvent, None, None]:
         """Two-phase generation: prefill + decode with KV cache."""
         prompt_len = input_ids.shape[1]
@@ -219,10 +263,11 @@ class InferenceEngine:
 
         t_start = time.perf_counter_ns()
         completion_tokens = 0
+        all_ids = input_ids  # track for repeat penalty
 
         # Phase 1: Prefill
         logits = self._scheduler.forward(input_ids, kv_cache=kv, start_pos=0)
-        next_token = _sample(logits, temperature)
+        next_token = _sample(logits, temperature, top_p, top_k, repeat_penalty, all_ids)
         t_prefill = time.perf_counter_ns()
         prefill_ns = t_prefill - t_start
         completion_tokens += 1
@@ -246,10 +291,11 @@ class InferenceEngine:
         # Phase 2: Decode — one token at a time
         for step in range(1, max_tokens):
             input_tensor = torch.tensor([[next_token]], dtype=torch.long)
+            all_ids = torch.cat([all_ids, input_tensor], dim=1)
             logits = self._scheduler.forward(
                 input_tensor, kv_cache=kv, start_pos=kv.current_seq_len,
             )
-            next_token = _sample(logits, temperature)
+            next_token = _sample(logits, temperature, top_p, top_k, repeat_penalty, all_ids)
             completion_tokens += 1
 
             decoded = self.tokenizer.decode([next_token])

@@ -249,6 +249,9 @@ def cmd_run(args):
                 messages,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                repeat_penalty=args.repeat_penalty,
             ):
                 print(event.text, end="", flush=True)
 
@@ -648,6 +651,9 @@ def main():
     )
     p_run.add_argument("--max-tokens", type=int, default=256, help="Max tokens per response")
     p_run.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    p_run.add_argument("--top-p", type=float, default=1.0, help="Top-p (nucleus) sampling (default: 1.0)")
+    p_run.add_argument("--top-k", type=int, default=0, help="Top-k sampling, 0=disabled (default: 0)")
+    p_run.add_argument("--repeat-penalty", type=float, default=1.0, help="Repeat penalty, 1.0=disabled (default: 1.0)")
     p_run.add_argument("--preload", action="store_true", default=True, help="Preload layers into VRAM")
 
     # pull
