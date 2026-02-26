@@ -16,6 +16,7 @@
 
 #include "gguf_dequant.h"
 #include "fused_gemv.h"
+#include "affine_q4_dequant.h"
 
 namespace py = pybind11;
 
@@ -106,6 +107,66 @@ static std::shared_ptr<GdsBufferHandle> py_load_file(
             " bytes, got " + std::to_string(bytes_read));
     }
     return handle;
+}
+
+/**
+ * Load a contiguous region of a file into a new CUDA buffer via GDS.
+ *
+ * Like load_file but starts reading at file_offset.  The returned handle
+ * owns size_bytes of CUDA memory, and view_tensor / dequant calls should
+ * use offsets relative to the *start of this buffer* (i.e. 0-based).
+ */
+static std::shared_ptr<GdsBufferHandle> py_load_file_region(
+    const std::string& filepath,
+    int64_t size_bytes,
+    int64_t file_offset,
+    int device_id = 0
+) {
+    auto handle = std::make_shared<GdsBufferHandle>(size_bytes, device_id);
+    ssize_t bytes_read = gds_read(
+        handle->raw(), filepath.c_str(), size_bytes, file_offset, 0
+    );
+    if (bytes_read < static_cast<ssize_t>(size_bytes)) {
+        throw std::runtime_error(
+            "py_load_file_region: expected " + std::to_string(size_bytes) +
+            " bytes, got " + std::to_string(bytes_read));
+    }
+    return handle;
+}
+
+/**
+ * Load one expert's weight + scale + bias data from a layer file into a single
+ * CUDA buffer via 3 GDS reads.  The buffer layout is [weight | scale | bias],
+ * and the returned offsets (0, w_size, w_size+s_size) can be passed directly
+ * to dequant_affine_q4 / fused_affine_q4_gemv.
+ */
+static py::tuple py_load_expert(
+    const std::string& filepath,
+    int64_t w_file_offset, int64_t w_size,
+    int64_t s_file_offset, int64_t s_size,
+    int64_t b_file_offset, int64_t b_size,
+    int device_id = 0
+) {
+    int64_t total = w_size + s_size + b_size;
+    auto handle = std::make_shared<GdsBufferHandle>(total, device_id);
+
+    // Read weight into buffer at offset 0
+    ssize_t r1 = gds_read(handle->raw(), filepath.c_str(), w_size, w_file_offset, 0);
+    if (r1 < static_cast<ssize_t>(w_size))
+        throw std::runtime_error("py_load_expert: short read on weight");
+
+    // Read scale into buffer at offset w_size
+    ssize_t r2 = gds_read(handle->raw(), filepath.c_str(), s_size, s_file_offset, w_size);
+    if (r2 < static_cast<ssize_t>(s_size))
+        throw std::runtime_error("py_load_expert: short read on scale");
+
+    // Read bias into buffer at offset w_size + s_size
+    ssize_t r3 = gds_read(handle->raw(), filepath.c_str(), b_size, b_file_offset, w_size + s_size);
+    if (r3 < static_cast<ssize_t>(b_size))
+        throw std::runtime_error("py_load_expert: short read on bias");
+
+    // Return (handle, weight_offset=0, scale_offset=w_size, bias_offset=w_size+s_size)
+    return py::make_tuple(handle, (int64_t)0, w_size, w_size + s_size);
 }
 
 /**
@@ -325,6 +386,131 @@ static torch::Tensor py_fused_dequant_gemv(
     return output;
 }
 
+/**
+ * Dequantize affine Q4 packed data from a GDS buffer into an fp16 tensor.
+ *
+ * Reads packed uint32 weights, fp16 scales, and fp16 biases from the buffer
+ * at their respective offsets and runs the affine Q4 dequant kernel.
+ *
+ * Args:
+ *   handle: GDS buffer containing the weight data
+ *   weight_shape: unpacked shape [out_dim, in_dim]
+ *   weight_offset: byte offset of packed uint32 weights
+ *   scale_offset: byte offset of fp16 scales
+ *   bias_offset: byte offset of fp16 biases
+ *   group_size: number of weights per scale/bias group (typically 128)
+ *   output_tensor: optional pre-allocated fp16 scratch buffer
+ */
+static torch::Tensor py_dequant_affine_q4(
+    std::shared_ptr<GdsBufferHandle> handle,
+    std::vector<int64_t> weight_shape,
+    int64_t weight_offset,
+    int64_t scale_offset,
+    int64_t bias_offset,
+    int group_size,
+    c10::optional<torch::Tensor> output_tensor
+) {
+    if (!handle || !handle->dev_ptr()) {
+        throw std::runtime_error("py_dequant_affine_q4: invalid buffer handle");
+    }
+    if (weight_shape.size() < 2) {
+        throw std::runtime_error("py_dequant_affine_q4: weight_shape must have >= 2 dims");
+    }
+
+    int64_t num_elements = 1;
+    for (auto s : weight_shape) num_elements *= s;
+
+    int in_dim = weight_shape.back();
+
+    // Pointers into the GDS buffer
+    const uint32_t* w_ptr = reinterpret_cast<const uint32_t*>(
+        static_cast<const char*>(handle->dev_ptr()) + weight_offset);
+    const __half* s_ptr = reinterpret_cast<const __half*>(
+        static_cast<const char*>(handle->dev_ptr()) + scale_offset);
+    const __half* b_ptr = reinterpret_cast<const __half*>(
+        static_cast<const char*>(handle->dev_ptr()) + bias_offset);
+
+    // Output tensor
+    torch::Tensor output;
+    if (output_tensor.has_value()) {
+        output = output_tensor.value();
+        if (output.numel() < num_elements) {
+            throw std::runtime_error(
+                "py_dequant_affine_q4: scratch buffer too small (" +
+                std::to_string(output.numel()) + " < " +
+                std::to_string(num_elements) + ")");
+        }
+        output = output.flatten().slice(0, 0, num_elements).view(weight_shape);
+    } else {
+        auto options = torch::TensorOptions()
+            .dtype(torch::kFloat16)
+            .device(torch::kCUDA, handle->device_id());
+        output = torch::empty(weight_shape, options);
+    }
+
+    __half* dst = reinterpret_cast<__half*>(output.data_ptr());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(handle->device_id());
+
+    launch_dequant_affine_q4(w_ptr, s_ptr, b_ptr, dst, num_elements, in_dim,
+                             group_size, stream);
+    return output;
+}
+
+/**
+ * Fused affine Q4 dequant + GEMV for decode (batch=1, seq_len=1).
+ *
+ * Reads packed uint32 weights, fp16 scales, and fp16 biases from the buffer
+ * and computes y = dequant(W) @ x in a single kernel, avoiding the fp16
+ * intermediate allocation.
+ */
+static torch::Tensor py_fused_affine_q4_gemv(
+    std::shared_ptr<GdsBufferHandle> handle,
+    torch::Tensor x,
+    std::vector<int64_t> weight_shape,
+    int64_t weight_offset,
+    int64_t scale_offset,
+    int64_t bias_offset,
+    int group_size
+) {
+    if (!handle || !handle->dev_ptr()) {
+        throw std::runtime_error("py_fused_affine_q4_gemv: invalid buffer handle");
+    }
+    if (weight_shape.size() != 2) {
+        throw std::runtime_error("py_fused_affine_q4_gemv: weight_shape must be [out_dim, in_dim]");
+    }
+
+    int out_dim = weight_shape[0];
+    int in_dim = weight_shape[1];
+
+    torch::Tensor x_flat = x.contiguous().view({-1});
+    if (x_flat.size(0) != in_dim) {
+        throw std::runtime_error(
+            "py_fused_affine_q4_gemv: input size " + std::to_string(x_flat.size(0)) +
+            " != in_dim " + std::to_string(in_dim));
+    }
+
+    const uint32_t* w_ptr = reinterpret_cast<const uint32_t*>(
+        static_cast<const char*>(handle->dev_ptr()) + weight_offset);
+    const __half* s_ptr = reinterpret_cast<const __half*>(
+        static_cast<const char*>(handle->dev_ptr()) + scale_offset);
+    const __half* b_ptr = reinterpret_cast<const __half*>(
+        static_cast<const char*>(handle->dev_ptr()) + bias_offset);
+
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat16)
+        .device(torch::kCUDA, handle->device_id());
+    torch::Tensor output = torch::empty({1, out_dim}, options);
+
+    const __half* x_ptr = reinterpret_cast<const __half*>(x_flat.data_ptr());
+    __half* y_ptr = reinterpret_cast<__half*>(output.data_ptr());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(handle->device_id());
+
+    launch_fused_affine_q4_gemv(w_ptr, s_ptr, b_ptr, x_ptr, y_ptr,
+                                out_dim, in_dim, group_size, stream);
+    return output;
+}
+
 // ─── Module definition ────────────────────────────────────────────────────
 
 PYBIND11_MODULE(gds_io_ext, m) {
@@ -352,6 +538,21 @@ PYBIND11_MODULE(gds_io_ext, m) {
           "Load an entire file from NVMe into a CUDA buffer via GDS.",
           py::arg("filepath"),
           py::arg("size_bytes"),
+          py::arg("device_id") = 0);
+
+    m.def("load_file_region", &py_load_file_region,
+          "Load a contiguous region of a file into a CUDA buffer via GDS.",
+          py::arg("filepath"),
+          py::arg("size_bytes"),
+          py::arg("file_offset"),
+          py::arg("device_id") = 0);
+
+    m.def("load_expert", &py_load_expert,
+          "Load one expert's weight+scale+bias into a single CUDA buffer via 3 GDS reads.",
+          py::arg("filepath"),
+          py::arg("w_file_offset"), py::arg("w_size"),
+          py::arg("s_file_offset"), py::arg("s_size"),
+          py::arg("b_file_offset"), py::arg("b_size"),
           py::arg("device_id") = 0);
 
     // Tensor view from buffer
@@ -389,4 +590,26 @@ PYBIND11_MODULE(gds_io_ext, m) {
           py::arg("weight_shape"),
           py::arg("gguf_type"),
           py::arg("offset"));
+
+    // Affine Q4 dequantization
+    m.def("dequant_affine_q4", &py_dequant_affine_q4,
+          "Dequantize affine Q4 packed data (uint32 + scales + biases) to fp16.",
+          py::arg("handle"),
+          py::arg("weight_shape"),
+          py::arg("weight_offset"),
+          py::arg("scale_offset"),
+          py::arg("bias_offset"),
+          py::arg("group_size"),
+          py::arg("output") = py::none());
+
+    // Fused affine Q4 dequant + GEMV (decode path)
+    m.def("fused_affine_q4_gemv", &py_fused_affine_q4_gemv,
+          "Fused affine Q4 dequant + GEMV for decode (batch=1).",
+          py::arg("handle"),
+          py::arg("x"),
+          py::arg("weight_shape"),
+          py::arg("weight_offset"),
+          py::arg("scale_offset"),
+          py::arg("bias_offset"),
+          py::arg("group_size"));
 }

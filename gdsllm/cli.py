@@ -229,6 +229,24 @@ def cmd_run(args):
         f"Model loaded: {info['name']} "
         f"({info['parameter_size']}, {info['quantization']})"
     )
+    if args.prompt:
+        # Non-interactive: single prompt, print response, exit
+        messages = [{"role": "user", "content": args.prompt}]
+        try:
+            for event in engine.generate_chat(
+                messages,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                repeat_penalty=args.repeat_penalty,
+            ):
+                print(event.text, end="", flush=True)
+            print()
+        finally:
+            engine.shutdown()
+        return
+
     print("Type your message (Ctrl+D or 'exit' to quit)\n")
 
     try:
@@ -266,13 +284,38 @@ def cmd_run(args):
 # ─── pull ────────────────────────────────────────────────────────────────────
 
 
-def cmd_pull(args):
-    """Download a HuggingFace model and convert to GdsLLM format."""
-    from huggingface_hub import snapshot_download
+def _detect_architecture(hf_path: str) -> str:
+    """Detect model architecture from downloaded HuggingFace config.json.
 
+    Returns "qwen3.5-moe" or "llama".
+    """
+    config_path = os.path.join(hf_path, "config.json")
+    if not os.path.isfile(config_path):
+        return "llama"
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # Check for Qwen3.5-MoE indicators
+    text_config = config.get("text_config", config)
+
+    # Has layer_types with linear_attention → Qwen3.5-MoE hybrid
+    layer_types = text_config.get("layer_types", [])
+    if any(t == "linear_attention" for t in layer_types):
+        return "qwen3.5-moe"
+
+    # Has num_experts + linear attention config keys
+    if (text_config.get("num_experts") and
+            text_config.get("linear_key_head_dim")):
+        return "qwen3.5-moe"
+
+    return "llama"
+
+
+def _pull_convert_llama(hf_path: str, output_dir: str, quantize: str):
+    """Convert a LLaMA-family model to GdsLLM format."""
     from gdsllm.tools.convert_weights import (
         ALIGNMENT,
-        LAYER_TENSOR_ORDER,
         build_tensor_index,
         convert_layer,
         convert_special,
@@ -280,6 +323,190 @@ def cmd_pull(args):
         get_safetensors_files,
         try_read_hf_config,
     )
+
+    print("Indexing safetensors files...")
+    safetensors_files = get_safetensors_files(hf_path)
+    print(f"  Found {len(safetensors_files)} safetensors file(s)")
+    tensor_index = build_tensor_index(safetensors_files)
+    print(f"  Indexed {len(tensor_index)} tensors")
+
+    print("Detecting model configuration...")
+    config = detect_model_config(tensor_index)
+    config = try_read_hf_config(hf_path, config)
+    print(f"  {config['num_layers']} layers, "
+          f"hidden_size={config['hidden_size']}, "
+          f"vocab_size={config['vocab_size']}")
+
+    # Convert special files
+    print("Converting embed_tokens...")
+    embed_meta = convert_special(
+        ["model.embed_tokens.weight"],
+        tensor_index, "embed_tokens.bin", output_dir,
+        quantize=quantize,
+    )
+
+    print("Converting final_norm...")
+    norm_meta = convert_special(
+        ["model.norm.weight"],
+        tensor_index, "final_norm.bin", output_dir,
+        quantize=quantize, force_fp16=True,
+    )
+
+    if "lm_head.weight" in tensor_index:
+        print("Converting lm_head...")
+        lm_head_meta = convert_special(
+            ["lm_head.weight"],
+            tensor_index, "lm_head.bin", output_dir,
+            quantize=quantize,
+        )
+        lm_head_tied = False
+    else:
+        print("lm_head tied to embed_tokens (weight sharing)")
+        lm_head_meta = None
+        lm_head_tied = True
+
+    layer_metas = []
+    for i in range(config["num_layers"]):
+        print(f"Converting layer {i}/{config['num_layers'] - 1}...")
+        layer_meta = convert_layer(
+            i, tensor_index, output_dir, quantize=quantize,
+        )
+        layer_metas.append(layer_meta)
+
+    dtype_label = "int8" if quantize == "int8" else "float16"
+    metadata = {
+        "model": "llama",
+        "dtype": dtype_label,
+        "quantization": quantize,
+        "alignment": ALIGNMENT,
+        **config,
+        "lm_head_tied": lm_head_tied,
+        "files": {
+            "embed_tokens": embed_meta,
+            "final_norm": norm_meta,
+            "lm_head": lm_head_meta,
+            "layers": layer_metas,
+        },
+    }
+
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    # Copy tokenizer files
+    tokenizer_files = [
+        "tokenizer.json", "tokenizer_config.json",
+        "tokenizer.model", "special_tokens_map.json",
+    ]
+    copied = 0
+    for tf in tokenizer_files:
+        src = os.path.join(hf_path, tf)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(output_dir, tf))
+            copied += 1
+    if copied:
+        print(f"Copied {copied} tokenizer files")
+
+
+def _pull_convert_qwen_moe(hf_path: str, output_dir: str):
+    """Convert a Qwen3.5-MoE model to GdsLLM format."""
+    from gdsllm.tools.convert_qwen_moe import (
+        build_gdsllm_config,
+        build_tensor_index,
+        convert_layer,
+        convert_special,
+        detect_layer_types,
+        get_safetensors_files,
+        read_hf_config,
+    )
+
+    print("Reading model configuration...")
+    hf_config = read_hf_config(hf_path)
+    layer_types = detect_layer_types(hf_config)
+    config = build_gdsllm_config(hf_config, layer_types)
+    group_size = config["group_size"]
+
+    num_full = sum(1 for t in layer_types if t == "full_attention")
+    num_linear = sum(1 for t in layer_types if t == "linear_attention")
+    print(f"  Model: qwen3.5-moe")
+    print(f"  Layers: {config['num_layers']} ({num_full} full attn + {num_linear} linear attn)")
+    print(f"  Hidden: {config['hidden_size']}, Heads: {config['num_heads']}, KV heads: {config['num_kv_heads']}")
+    print(f"  MoE: {config['num_experts']} experts, top-{config['num_experts_per_token']}")
+    print(f"  Quantization: affine Q4 (group_size={group_size})")
+
+    print("Indexing safetensors files...")
+    safetensors_files = get_safetensors_files(hf_path)
+    print(f"  Found {len(safetensors_files)} safetensors file(s)")
+    tensor_index = build_tensor_index(safetensors_files)
+    print(f"  Indexed {len(tensor_index)} tensors")
+
+    # Convert special files
+    print("Converting embed_tokens...")
+    embed_meta = convert_special(
+        [("language_model.model.embed_tokens.weight", "model.embed_tokens.weight")],
+        tensor_index, "embed_tokens.bin", output_dir,
+    )
+
+    print("Converting final_norm...")
+    norm_meta = convert_special(
+        [("language_model.model.norm.weight", "model.norm.weight")],
+        tensor_index, "final_norm.bin", output_dir,
+    )
+
+    if not config["lm_head_tied"]:
+        print("Converting lm_head...")
+        lm_head_meta = convert_special(
+            [("language_model.lm_head.weight", "lm_head.weight")],
+            tensor_index, "lm_head.bin", output_dir,
+        )
+    else:
+        print("lm_head tied to embed_tokens (weight sharing)")
+        lm_head_meta = None
+
+    # Convert layers
+    layer_metas = []
+    for i in range(config["num_layers"]):
+        lt = layer_types[i]
+        lt_short = "full" if lt == "full_attention" else "linear"
+        print(f"Converting layer {i}/{config['num_layers'] - 1} ({lt_short})...")
+        layer_meta = convert_layer(i, lt, tensor_index, output_dir, group_size)
+        layer_metas.append(layer_meta)
+
+    # Write metadata
+    metadata = {
+        **config,
+        "files": {
+            "embed_tokens": embed_meta,
+            "final_norm": norm_meta,
+            "lm_head": lm_head_meta,
+            "layers": layer_metas,
+        },
+    }
+
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Wrote metadata to {metadata_path}")
+
+    # Copy tokenizer files (including Qwen-specific files)
+    tokenizer_files = [
+        "tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+        "special_tokens_map.json", "added_tokens.json", "vocab.json",
+        "merges.txt", "chat_template.jinja",
+    ]
+    copied = 0
+    for tf in tokenizer_files:
+        src = os.path.join(hf_path, tf)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(output_dir, tf))
+            copied += 1
+    if copied:
+        print(f"Copied {copied} tokenizer files")
+
+
+def cmd_pull(args):
+    """Download a HuggingFace model and convert to GdsLLM format."""
+    from huggingface_hub import snapshot_download
 
     model_root = _model_root()
     hf_cache = _hf_cache()
@@ -330,7 +557,10 @@ def cmd_pull(args):
             "*.safetensors",
             "*.json",
             "*.model",         # sentencepiece tokenizer
+            "*.jinja",         # chat template (Qwen)
             "tokenizer*",
+            "vocab.*",
+            "merges.txt",
         ],
         ignore_patterns=[
             "*.bin",           # skip pytorch_model.bin
@@ -343,99 +573,17 @@ def cmd_pull(args):
     dl_size = _dir_size(hf_path) / (1024**3)
     print(f"Download complete: {hf_path} ({dl_size:.2f} GB)\n")
 
-    # ── Step 2: Convert to GdsLLM format ──
+    # ── Step 2: Detect architecture and convert ──
 
-    print(f"Converting to GdsLLM format in {output_dir}")
+    arch = _detect_architecture(hf_path)
+    print(f"Detected architecture: {arch}")
+    print(f"Converting to GdsLLM format in {output_dir}\n")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Index tensors
-    print("Indexing safetensors files...")
-    safetensors_files = get_safetensors_files(hf_path)
-    print(f"  Found {len(safetensors_files)} safetensors file(s)")
-    tensor_index = build_tensor_index(safetensors_files)
-    print(f"  Indexed {len(tensor_index)} tensors")
-
-    # Detect config
-    print("Detecting model configuration...")
-    config = detect_model_config(tensor_index)
-    config = try_read_hf_config(hf_path, config)
-    print(f"  {config['num_layers']} layers, "
-          f"hidden_size={config['hidden_size']}, "
-          f"vocab_size={config['vocab_size']}")
-
-    quantize = args.quantize
-
-    # Convert special files
-    print("Converting embed_tokens...")
-    embed_meta = convert_special(
-        ["model.embed_tokens.weight"],
-        tensor_index, "embed_tokens.bin", output_dir,
-        quantize=quantize,
-    )
-
-    print("Converting final_norm...")
-    norm_meta = convert_special(
-        ["model.norm.weight"],
-        tensor_index, "final_norm.bin", output_dir,
-        quantize=quantize, force_fp16=True,
-    )
-
-    if "lm_head.weight" in tensor_index:
-        print("Converting lm_head...")
-        lm_head_meta = convert_special(
-            ["lm_head.weight"],
-            tensor_index, "lm_head.bin", output_dir,
-            quantize=quantize,
-        )
-        lm_head_tied = False
+    if arch == "qwen3.5-moe":
+        _pull_convert_qwen_moe(hf_path, output_dir)
     else:
-        print("lm_head tied to embed_tokens (weight sharing)")
-        lm_head_meta = None
-        lm_head_tied = True
-
-    # Convert layers
-    layer_metas = []
-    for i in range(config["num_layers"]):
-        print(f"Converting layer {i}/{config['num_layers'] - 1}...")
-        layer_meta = convert_layer(
-            i, tensor_index, output_dir, quantize=quantize,
-        )
-        layer_metas.append(layer_meta)
-
-    # Write metadata
-    dtype_label = "int8" if quantize == "int8" else "float16"
-    metadata = {
-        "model": "llama",
-        "dtype": dtype_label,
-        "quantization": quantize,
-        "alignment": ALIGNMENT,
-        **config,
-        "lm_head_tied": lm_head_tied,
-        "files": {
-            "embed_tokens": embed_meta,
-            "final_norm": norm_meta,
-            "lm_head": lm_head_meta,
-            "layers": layer_metas,
-        },
-    }
-
-    metadata_path = os.path.join(output_dir, "metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    # Copy tokenizer files
-    tokenizer_files = [
-        "tokenizer.json", "tokenizer_config.json",
-        "tokenizer.model", "special_tokens_map.json",
-    ]
-    copied = 0
-    for tf in tokenizer_files:
-        src = os.path.join(hf_path, tf)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(output_dir, tf))
-            copied += 1
-    if copied:
-        print(f"Copied {copied} tokenizer files")
+        _pull_convert_llama(hf_path, output_dir, args.quantize)
 
     # Summary
     total_size = _dir_size(output_dir)
@@ -599,14 +747,30 @@ def cmd_show(args):
     # Size
     total_size = _dir_size(model_dir)
 
+    family = meta.get("model", "llama")
+
     print(f"  Model:          {name}")
-    print(f"  Family:         llama")
+    print(f"  Family:         {family}")
     print(f"  Quantization:   {quant.upper() if quant != 'none' else 'FP16'}")
     print(f"  Hidden size:    {hidden}")
     print(f"  Layers:         {layers}")
     print(f"  Attention:      {heads} heads ({kv_heads} KV heads)")
     print(f"  Vocab size:     {vocab}")
     print(f"  Max seq len:    {max_seq}")
+
+    # MoE info
+    num_experts = meta.get("num_experts")
+    if num_experts:
+        top_k = meta.get("num_experts_per_token", "?")
+        print(f"  MoE:            {num_experts} experts (top-{top_k})")
+
+    # Layer type breakdown
+    layer_types = meta.get("layer_types", [])
+    if layer_types:
+        num_full = sum(1 for t in layer_types if t == "full_attention")
+        num_linear = len(layer_types) - num_full
+        print(f"  Layer types:    {num_full} full attn + {num_linear} linear attn")
+
     print(f"  Size on disk:   {total_size / 1e9:.2f} GB")
 
 
@@ -655,6 +819,7 @@ def main():
     p_run.add_argument("--top-k", type=int, default=0, help="Top-k sampling, 0=disabled (default: 0)")
     p_run.add_argument("--repeat-penalty", type=float, default=1.0, help="Repeat penalty, 1.0=disabled (default: 1.0)")
     p_run.add_argument("--preload", action="store_true", default=True, help="Preload layers into VRAM")
+    p_run.add_argument("--prompt", type=str, default=None, help="Single prompt (non-interactive mode, exits after generation)")
 
     # pull
     p_pull = subparsers.add_parser("pull", help="Download and convert a HuggingFace model")

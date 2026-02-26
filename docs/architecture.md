@@ -77,12 +77,16 @@ gdsllm/
 │   ├── cli.py                     # CLI (serve, run, pull, list, show, rm, stop)
 │   ├── runtime/
 │   │   ├── llama.py               # LLaMA forward pass (attention, MLP, RoPE)
-│   │   ├── scheduler.py           # SimpleScheduler & CachedScheduler
+│   │   ├── qwen_moe.py            # Qwen3.5-MoE forward pass (hybrid attn, MoE MLP)
+│   │   ├── scheduler.py           # SimpleScheduler & CachedScheduler (LLaMA)
+│   │   ├── qwen_moe_scheduler.py  # QwenMoEScheduler & QwenMoECachedScheduler
 │   │   ├── kv_cache.py            # KV cache for autoregressive decoding
+│   │   ├── hybrid_cache.py        # Hybrid KV + SSM state cache (Qwen3.5-MoE)
 │   │   ├── torch_bridge.py        # ModelWeights & LayerCache (weight loading)
 │   │   ├── gds_bindings.cpp       # pybind11 bindings (Python ↔ C++)
 │   │   ├── gds_io.cu              # cuFile DMA I/O (NVMe → VRAM)
-│   │   ├── gguf_dequant.cu/h      # Q4_0/Q8_0 dequantization kernels
+│   │   ├── gguf_dequant.cu/h      # Q4_0/Q8_0 dequantization kernels (GGUF)
+│   │   ├── affine_q4_dequant.cu/h # Affine Q4 dequantization kernels (SWAN)
 │   │   └── fused_gemv.cu/h        # Fused dequant+GEMV kernels
 │   ├── server/
 │   │   ├── app.py                 # FastAPI app, auth middleware, lifecycle
@@ -92,7 +96,8 @@ gdsllm/
 │   └── tools/
 │       ├── download_model.py      # HuggingFace Hub downloader
 │       ├── convert_weights.py     # Safetensors → GdsLLM flat binaries
-│       └── convert_gguf.py        # GGUF → GdsLLM flat binaries
+│       ├── convert_gguf.py        # GGUF → GdsLLM flat binaries
+│       └── convert_qwen_moe.py    # Qwen3.5-MoE safetensors → GdsLLM format
 ├── examples/
 │   └── inference_demo.py          # Standalone inference example
 ├── setup.py                       # CUDA auto-detection + cuFile build
@@ -180,6 +185,75 @@ Implements the LLaMA transformer architecture:
 - **`attention(h, weights, freqs, mask, kv_cache)`** — Multi-head attention with GQA support
 - **`mlp(h, weights, ...)`** — SwiGLU MLP: `down(gate * silu(up))`
 - **`transformer_block()`** — Full pre-norm layer: attn + MLP with residuals
+
+### Qwen3.5-MoE Forward Pass (`qwen_moe.py`)
+
+Implements the Qwen3.5-MoE hybrid architecture (397B parameters, 17B active):
+
+**Architecture overview**:
+- 60 layers: 15 full attention (every 4th) + 45 linear attention (gated delta rule)
+- MoE MLP on every layer: 512 experts, top-10 routing, + 1 shared expert
+- Affine Q4 quantization: `W_fp = nibble * scale + bias` (per-group, group_size=128)
+- Gated attention: `q_proj` outputs 2x size, split into Q and sigmoid gate
+
+**Key functions**:
+- **`affine_q4_linear(x, weights, prefix, scratch)`** — Linear projection with affine Q4 dequant
+- **`full_attention()`** — Multi-head attention with QK-norm, partial RoPE (25%), and output gate
+  - `q_proj` outputs `num_heads * head_dim * 2` → split into Q and per-head gate
+  - Output: `sigmoid(gate) * attn_output` before `o_proj`
+- **`linear_attention()`** — Gated delta rule linear attention with causal Conv1d
+  - Conv1d with `kernel_size=4`, left-padded with zeros on first forward
+  - Gated delta rule: `Δ = sigmoid(β) * Δ_base`, applied to recurrent state `S`
+  - Gated output: `sigmoid(g) * o` before output projection
+- **`moe_route()`** — Top-k expert routing with sigmoid normalization
+- **`moe_mlp_selective()`** — MoE MLP computing only selected experts
+  - SwiGLU per expert: `down(silu(gate) * up)`
+  - Shared expert with learned gating: `sigmoid(shared_gate) * shared_out`
+  - fp16 clamp on output to prevent overflow
+
+**Numerical stability**:
+- Residual additions (`h + attn_out`, `h + mlp_out`) are clamped to fp16 safe range (±65504)
+  to prevent -inf overflow that propagates through RMSNorm as NaN.
+
+### Qwen3.5-MoE Scheduler (`qwen_moe_scheduler.py`)
+
+Two-phase per-layer loading to minimize NVMe bandwidth:
+
+```
+Phase 1: Load attention + norms + router + shared expert (~100 MB/layer)
+         → Compute attention, run routing
+Phase 2: Load only selected 10 experts (~65 MB)
+         → Compute MoE MLP
+         (vs loading all 512 experts: ~3.2 GB — 50x reduction)
+```
+
+**`QwenMoEScheduler`** — Minimal VRAM, load/free per layer.
+
+**`QwenMoECachedScheduler`** — Adaptive VRAM caching with LayerCache.
+- `load_layer_partial()` — Load layer without expert weights
+- `load_experts()` — Load only routed experts
+- CUDA sync before buffer deallocation to prevent use-after-free
+
+### Hybrid Cache (`hybrid_cache.py`)
+
+Combined KV + SSM state cache for Qwen3.5-MoE:
+
+- **Full attention layers** (15 of 60): Standard KV cache — `[batch, num_kv_heads, seq_len, head_dim]`
+- **Linear attention layers** (45 of 60): Conv state (`[batch, d_conv, kernel_size-1]`) + recurrent SSM hidden state (`[batch, num_heads, key_dim, value_dim]`)
+- Lazy initialization: SSM states allocated on first use
+- `advance(num_tokens)` increments KV position, SSM state is stateful (no position tracking)
+
+### Affine Q4 Dequantization (`affine_q4_dequant.cu`)
+
+GPU kernels for SWAN-format affine 4-bit weights:
+
+| Format | Group Size | Storage | Dequant |
+|--------|-----------|---------|---------|
+| Affine Q4 | 128 weights | uint32 packed (8 nibbles) + fp16 scale + fp16 bias | `out = nibble * scale + bias` |
+
+Two kernels:
+- **`kernel_dequant_affine_q4`** — Dequant to fp16 tensor (for prefill → cuBLAS GEMM)
+- **`kernel_affine_q4_gemv`** — Fused dequant+GEMV (for decode, batch=1)
 
 ### Scheduler (`scheduler.py`)
 
@@ -335,11 +409,30 @@ Converts GGUF files to GdsLLM format:
 - Dequantizes unsupported types (Q6_K, Q5_K) to fp16 on CPU
 - Extracts tokenizer from GGUF metadata and builds HF-compatible `tokenizer.json`
 
+### Convert Qwen3.5-MoE (`convert_qwen_moe.py`)
+
+Converts SWAN 4-bit quantized Qwen3.5-MoE safetensors to GdsLLM format:
+
+1. Index all tensors from safetensors files (strips `language_model.model.` prefix)
+2. Detect hybrid architecture: full attention vs linear attention layer types
+3. Write layer files with all attention + MoE tensors (including 512 expert weights)
+4. Pack affine Q4 weights: uint32 packed nibbles + fp16 scales + fp16 biases
+5. Handle 3D expert tensors `[num_experts, intermediate, hidden]`
+6. Generate `metadata.json` with MoE-specific fields (expert counts, layer types, etc.)
+7. Copy tokenizer files
+
+Usage:
+```bash
+python -m gdsllm.tools.convert_qwen_moe \
+    /path/to/Qwen3.5-397B-A17B-SWAN-4bit \
+    /mnt/SSD2TB/gdsllm_model/Qwen3.5-397B-A17B-SWAN-4bit
+```
+
 ---
 
 ## Model Format
 
-### Directory Layout
+### LLaMA Directory Layout
 
 ```
 model_dir/
@@ -356,17 +449,51 @@ model_dir/
 └── tokenizer.model            # SentencePiece (if applicable)
 ```
 
-### metadata.json
+### Qwen3.5-MoE Directory Layout
+
+```
+model_dir/
+├── metadata.json              # Config + MoE fields (layer_types, expert counts)
+├── embed_tokens.bin           # Embedding weights (fp16)
+├── final_norm.bin             # Final RMSNorm weights (fp16)
+├── lm_head.bin                # Output projection weights (affine Q4)
+├── layer_000.bin              # Layer 0 — attention + norms + router + 512 experts
+├── ...                        # Each layer: ~3.3 GB (mostly expert weights)
+├── layer_059.bin              # 60 layers total
+├── tokenizer.json
+└── tokenizer_config.json
+```
+
+Qwen3.5-MoE tensors per layer vary by layer type:
+
+**Full attention layers** (15 of 60):
+```
+input_layernorm.weight, self_attn.{q,k,v,o}_proj.weight,
+self_attn.{q,k}_norm.weight, post_attention_layernorm.weight,
+mlp.router.weight, mlp.shared_expert.{gate,up,down}_proj.weight,
+mlp.shared_expert_gate.weight,
+mlp.switch_mlp.{gate,up,down}_proj.weight  (each [512, 1024, 4096])
+```
+
+**Linear attention layers** (45 of 60):
+```
+input_layernorm.weight, self_attn.{q,k,v,o}_proj.weight,
+self_attn.conv.weight, self_attn.{beta,lambda_q,lambda_k,g}.weight,
+post_attention_layernorm.weight,
+mlp.router.weight, mlp.shared_expert.{gate,up,down}_proj.weight,
+mlp.shared_expert_gate.weight,
+mlp.switch_mlp.{gate,up,down}_proj.weight  (each [512, 1024, 4096])
+```
+
+### metadata.json (LLaMA)
 
 ```json
 {
   "model": "llama",
   "dtype": "float16",
   "quantization": "q4_0",
-  "alignment": 4096,
   "vocab_size": 128256,
   "hidden_size": 8192,
-  "intermediate_size": 28672,
   "num_layers": 80,
   "num_heads": 64,
   "num_kv_heads": 8,
@@ -374,28 +501,39 @@ model_dir/
   "rms_norm_eps": 1e-5,
   "rope_theta": 500000.0,
   "max_seq_len": 131072,
-  "rope_scaling": { "type": "llama3", "factor": 8.0, ... },
-  "files": {
-    "embed_tokens": {
-      "path": "embed_tokens.bin",
-      "size_bytes": ...,
-      "tensors": [{ "name": "...", "shape": [...], "dtype": "...", "offset": 0, "size_bytes": ... }]
-    },
-    "final_norm": { ... },
-    "lm_head": { ... },
-    "layers": [
-      {
-        "index": 0,
-        "path": "layer_000.bin",
-        "size_bytes": ...,
-        "tensors": [
-          { "name": "input_layernorm.weight", "shape": [8192], "dtype": "float16", "offset": 0, ... },
-          { "name": "self_attn.q_proj.weight", "shape": [8192, 8192], "dtype": "gguf_q4_0", "offset": 4096, "quant": "q4_0", "block_size": 32, ... },
-          ...
-        ]
-      }
-    ]
-  }
+  "files": { "embed_tokens": {...}, "layers": [{...}], ... }
+}
+```
+
+### metadata.json (Qwen3.5-MoE)
+
+```json
+{
+  "model": "qwen3.5-moe",
+  "dtype": "affine_q4",
+  "quantization": "affine_q4",
+  "vocab_size": 248320,
+  "hidden_size": 4096,
+  "num_layers": 60,
+  "num_heads": 32,
+  "num_kv_heads": 2,
+  "head_dim": 256,
+  "partial_rotary_factor": 0.25,
+  "attn_output_gate": true,
+  "num_experts": 512,
+  "num_experts_per_token": 10,
+  "moe_intermediate_size": 1024,
+  "shared_expert_intermediate_size": 1024,
+  "full_attn_layers": [3, 7, 11, ...],
+  "layer_types": ["linear_attention", "linear_attention", ...],
+  "linear_key_head_dim": 128,
+  "linear_value_head_dim": 128,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 64,
+  "linear_conv_kernel_dim": 4,
+  "group_size": 128,
+  "quant_bits": 4,
+  "files": { "embed_tokens": {...}, "layers": [{...}], ... }
 }
 ```
 
@@ -451,8 +589,9 @@ Behavior varies by model size:
 
 | Model | Layers | Cached | Bottleneck | Speed |
 |-------|--------|--------|-----------|-------|
-| 7B Q4_0 | 32 | All | GPU compute | 59.3 tok/s |
-| 70B Q4_0 | 80 | 6-7 | NVMe I/O (~7 GB/s) | 0.15 tok/s |
+| LLaMA 7B Q4_0 | 32 | All | GPU compute | 59.3 tok/s |
+| LLaMA 70B Q4_0 | 80 | 6-7 | NVMe I/O (~7 GB/s) | 0.15 tok/s |
+| Qwen3.5-MoE 397B (17B active) | 60 | 0 | NVMe I/O | NVMe-bound |
 
 Hardware: RTX 4080 16GB, CUDA 12.8, NVMe Gen4 x4.
 
@@ -460,3 +599,12 @@ Key optimizations:
 - **Scratch buffer reuse**: -17% latency for NVMe-bound decode
 - **Fused dequant+GEMV**: 10x speedup for GPU-bound decode
 - **Adaptive caching**: Maximizes resident layers within VRAM budget
+- **Selective expert loading** (MoE): Load 10 of 512 experts per token (~65 MB vs ~3.2 GB per layer)
+- **fp16 overflow clamping**: Residual additions clamped to ±65504 to prevent NaN propagation
+
+## Supported Models
+
+| Model Family | Architecture | Quantization | Status |
+|-------------|-------------|-------------|--------|
+| LLaMA 2/3/3.x | Dense transformer | GGUF Q4_0, Q8_0, fp16 | Stable |
+| Qwen3.5-MoE (397B) | Hybrid attention + MoE | Affine Q4 (SWAN) | Working |

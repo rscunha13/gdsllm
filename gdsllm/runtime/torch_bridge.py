@@ -22,10 +22,17 @@ class TensorMeta:
     size_bytes: int
     padded_size: int
     quant: Optional[str] = None
+    # INT8 / GGUF scale fields
     scale_shape: Optional[List[int]] = None
     scale_offset: Optional[int] = None
     scale_size_bytes: Optional[int] = None
     scale_padded_size: Optional[int] = None
+    # Affine Q4 additional fields
+    group_size: Optional[int] = None
+    bias_shape: Optional[List[int]] = None
+    bias_offset: Optional[int] = None
+    bias_size_bytes: Optional[int] = None
+    bias_padded_size: Optional[int] = None
 
 
 @dataclass
@@ -33,6 +40,7 @@ class LayerMeta:
     index: int
     path: str
     size_bytes: int
+    layer_type: Optional[str] = None  # "full_attention", "linear_attention", etc.
     tensors: List[TensorMeta] = field(default_factory=list)
 
 
@@ -57,6 +65,11 @@ def _parse_tensors(raw_list: list) -> List[TensorMeta]:
             scale_offset=t.get("scale_offset"),
             scale_size_bytes=t.get("scale_size_bytes"),
             scale_padded_size=t.get("scale_padded_size"),
+            group_size=t.get("group_size"),
+            bias_shape=t.get("bias_shape"),
+            bias_offset=t.get("bias_offset"),
+            bias_size_bytes=t.get("bias_size_bytes"),
+            bias_padded_size=t.get("bias_padded_size"),
         )
         for t in raw_list
     ]
@@ -80,6 +93,7 @@ class ModelWeights:
                     index=lm["index"],
                     path=lm["path"],
                     size_bytes=lm["size_bytes"],
+                    layer_type=lm.get("layer_type"),
                     tensors=_parse_tensors(lm["tensors"]),
                 )
             )
@@ -109,7 +123,7 @@ class ModelWeights:
             self._gds_initialized = False
 
     def _make_tensor_entry(self, handle, t: TensorMeta):
-        """Create a tensor view or GGUF deferred-dequant dict for a single tensor."""
+        """Create a tensor view or deferred-dequant dict for a single tensor."""
         if t.quant in ("q4_0", "q8_0"):
             # GGUF block-quantized: store metadata dict for deferred GPU dequant
             return {
@@ -117,6 +131,17 @@ class ModelWeights:
                 "shape": t.shape,
                 "gguf_type": t.quant,
                 "offset": t.offset,
+            }
+        if t.quant == "affine_q4":
+            # Affine Q4: packed uint32 weights + fp16 scales + fp16 biases
+            return {
+                "buffer": handle,
+                "shape": t.shape,
+                "quant_type": "affine_q4",
+                "weight_offset": t.offset,
+                "scale_offset": t.scale_offset,
+                "bias_offset": t.bias_offset,
+                "group_size": t.group_size,
             }
         return self._ext.view_tensor(handle, t.shape, t.dtype, t.offset)
 
@@ -150,6 +175,191 @@ class ModelWeights:
                 )
 
         return tensors, handle
+
+    def load_layer_partial(
+        self, layer_index: int, exclude_prefixes: Tuple[str, ...] = ("mlp.switch_mlp.",)
+    ) -> Tuple[Dict[str, torch.Tensor], list]:
+        """Load a layer's tensors EXCLUDING those matching exclude_prefixes.
+
+        Instead of loading the full layer file (which can be 3+ GB for MoE),
+        loads only the byte ranges containing the non-excluded tensors.
+        This enables two-phase loading: load attention/router first, then
+        load only the selected experts separately via load_experts().
+
+        Returns:
+            (tensors_dict, buffer_handles_list)
+            The caller MUST keep buffer_handles alive while using the tensors.
+        """
+        layer = self.layers[layer_index]
+        filepath = os.path.join(self.model_dir, layer.path)
+
+        # Partition tensors into included and excluded
+        included = []
+        for t in layer.tensors:
+            if not any(t.name.startswith(p) for p in exclude_prefixes):
+                included.append(t)
+
+        if not included:
+            return {}, []
+
+        # Build sorted list of (offset, end) for included tensors
+        # (including Q4 scale/bias regions)
+        regions = []
+        for t in included:
+            end = t.offset + t.padded_size
+            if t.scale_offset is not None and t.scale_padded_size is not None:
+                end = max(end, t.scale_offset + t.scale_padded_size)
+            if t.bias_offset is not None and t.bias_padded_size is not None:
+                end = max(end, t.bias_offset + t.bias_padded_size)
+            regions.append((t.offset, end))
+
+        # Merge into contiguous regions (tensors are stored sequentially)
+        regions.sort()
+        merged = [regions[0]]
+        for start, end in regions[1:]:
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+
+        # Load each contiguous region as a separate GDS buffer
+        handles = []
+        region_map = []  # (file_start, file_end, handle)
+        for region_start, region_end in merged:
+            size = region_end - region_start
+            handle = self._ext.load_file_region(filepath, size, region_start)
+            handles.append(handle)
+            region_map.append((region_start, region_end, handle))
+
+        def _find_handle(file_offset):
+            """Find the buffer handle and remap offset for a file offset."""
+            for rstart, rend, h in region_map:
+                if rstart <= file_offset < rend:
+                    return h, file_offset - rstart
+            raise ValueError(f"File offset {file_offset} not in any loaded region")
+
+        # Build tensor dict with remapped offsets
+        tensors = {}
+        for t in included:
+            if t.quant == "affine_q4":
+                handle, w_off = _find_handle(t.offset)
+                _, s_off = _find_handle(t.scale_offset)
+                _, b_off = _find_handle(t.bias_offset)
+                tensors[t.name] = {
+                    "buffer": handle,
+                    "shape": t.shape,
+                    "quant_type": "affine_q4",
+                    "weight_offset": w_off,
+                    "scale_offset": s_off,
+                    "bias_offset": b_off,
+                    "group_size": t.group_size,
+                }
+            elif t.quant in ("q4_0", "q8_0"):
+                handle, off = _find_handle(t.offset)
+                tensors[t.name] = {
+                    "buffer": handle,
+                    "shape": t.shape,
+                    "gguf_type": t.quant,
+                    "offset": off,
+                }
+            else:
+                handle, off = _find_handle(t.offset)
+                tensors[t.name] = self._ext.view_tensor(
+                    handle, t.shape, t.dtype, off
+                )
+                if t.quant == "int8" and t.scale_offset is not None:
+                    sh, soff = _find_handle(t.scale_offset)
+                    scale_name = (
+                        t.name.rsplit(".weight", 1)[0] + ".scale"
+                        if t.name.endswith(".weight")
+                        else t.name + ".scale"
+                    )
+                    tensors[scale_name] = self._ext.view_tensor(
+                        sh, t.scale_shape, "float16", soff
+                    )
+
+        return tensors, handles
+
+    def load_experts(
+        self,
+        layer_index: int,
+        expert_indices: list,
+        proj_names: Tuple[str, ...] = (
+            "mlp.switch_mlp.gate_proj",
+            "mlp.switch_mlp.up_proj",
+            "mlp.switch_mlp.down_proj",
+        ),
+    ) -> Tuple[Dict[str, dict], list]:
+        """Load specific expert weight slices from a layer file via GDS.
+
+        For each projection and each expert index, loads only that expert's
+        weight/scale/bias data instead of all 512 experts.
+
+        Args:
+            layer_index: Layer index.
+            expert_indices: List of expert IDs to load (e.g. [5, 12, 45, ...]).
+            proj_names: Projection name prefixes to load.
+
+        Returns:
+            (expert_dict, handles_list)
+            expert_dict maps "gate_proj.5" -> dict with w/s/b handles + metadata
+            The caller MUST keep handles alive while using the tensors.
+        """
+        layer = self.layers[layer_index]
+        filepath = os.path.join(self.model_dir, layer.path)
+
+        # Build lookup: tensor name -> TensorMeta
+        tensor_lookup = {t.name: t for t in layer.tensors}
+
+        expert_tensors = {}
+        handles = []
+
+        for proj in proj_names:
+            w_name = f"{proj}.weight"
+            t = tensor_lookup.get(w_name)
+            if t is None or t.quant != "affine_q4":
+                continue
+
+            num_experts = t.shape[0]
+            # Per-expert sizes (3D tensor: [num_experts, ...])
+            w_per_expert = t.padded_size // num_experts
+            s_per_expert = t.scale_size_bytes // num_experts
+            b_per_expert = t.bias_size_bytes // num_experts
+
+            # Single expert shape: drop the first dimension
+            expert_shape = t.shape[1:]
+
+            for eidx in expert_indices:
+                # Compute file offsets for this expert
+                w_file_offset = t.offset + eidx * w_per_expert
+                s_file_offset = t.scale_offset + eidx * s_per_expert
+                b_file_offset = t.bias_offset + eidx * b_per_expert
+
+                # Load w+s+b into single buffer via 3 GDS reads
+                handle, w_off, s_off, b_off = self._ext.load_expert(
+                    filepath,
+                    w_file_offset, w_per_expert,
+                    s_file_offset, s_per_expert,
+                    b_file_offset, b_per_expert,
+                )
+                handles.append(handle)
+
+                # Short name: "gate_proj.5"
+                short_proj = proj.rsplit(".", 1)[-1]
+                key = f"{short_proj}.{eidx}"
+
+                expert_tensors[key] = {
+                    "buffer": handle,
+                    "shape": expert_shape,
+                    "quant_type": "affine_q4",
+                    "weight_offset": w_off,
+                    "scale_offset": s_off,
+                    "bias_offset": b_off,
+                    "group_size": t.group_size,
+                }
+
+        return expert_tensors, handles
 
     def load_special(self, name: str) -> Tuple[Dict[str, torch.Tensor], object]:
         """Load a special file (embed_tokens, final_norm, lm_head) via GDS.

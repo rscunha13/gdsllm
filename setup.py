@@ -111,6 +111,7 @@ setup(
                 "gdsllm/runtime/gds_io.cu",
                 "gdsllm/runtime/gguf_dequant.cu",
                 "gdsllm/runtime/fused_gemv.cu",
+                "gdsllm/runtime/affine_q4_dequant.cu",
                 "gdsllm/runtime/gds_bindings.cpp",
             ],
             include_dirs=[include_dir],

@@ -22,6 +22,10 @@ from gdsllm.runtime.scheduler import (
     estimate_activation_vram,
 )
 from gdsllm.runtime.kv_cache import KVCache
+from gdsllm.runtime.qwen_moe_scheduler import (
+    QwenMoECachedScheduler,
+    QwenMoEScheduler,
+)
 
 
 @dataclass
@@ -79,6 +83,14 @@ def _sample(
         mask = cumulative_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
         sorted_logits[mask] = float("-inf")
         next_logits = sorted_logits.scatter(0, sorted_idx, sorted_logits)
+
+    # Guard against NaN/Inf from numerical issues in new model paths
+    if torch.isnan(next_logits).any() or torch.isinf(next_logits).all():
+        import sys
+        print("[WARN] logits contain NaN/Inf — falling back to argmax of finite values", file=sys.stderr)
+        finite = next_logits.clone()
+        finite[~torch.isfinite(finite)] = float("-inf")
+        return finite.argmax().item()
 
     probs = torch.softmax(next_logits, dim=-1)
     return torch.multinomial(probs, 1).item()
@@ -154,20 +166,43 @@ class InferenceEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         self.stop_ids = _get_stop_token_ids(self.tokenizer)
 
-        # Create scheduler
-        if preload:
-            self._scheduler = CachedScheduler(
-                self.model_dir, preload=False,
-            )
-            # We'll preload after entering context
-            self._preload = True
+        # Detect model type from metadata
+        self._model_type = self._detect_model_type()
+
+        # Create scheduler based on model type
+        if self._model_type == "qwen3.5-moe":
+            if preload:
+                self._scheduler = QwenMoECachedScheduler(
+                    self.model_dir, preload=False,
+                )
+                self._preload = True
+            else:
+                self._scheduler = QwenMoEScheduler(self.model_dir)
+                self._preload = False
         else:
-            self._scheduler = SimpleScheduler(self.model_dir)
-            self._preload = False
+            if preload:
+                self._scheduler = CachedScheduler(
+                    self.model_dir, preload=False,
+                )
+                self._preload = True
+            else:
+                self._scheduler = SimpleScheduler(self.model_dir)
+                self._preload = False
 
         self.config = self._scheduler.config
         self._context_entered = False
         self._enter_context()
+
+    def _detect_model_type(self) -> str:
+        """Detect model type from metadata.json."""
+        import json
+        metadata_path = os.path.join(self.model_dir, "metadata.json")
+        try:
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            return metadata.get("model", "llama")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return "llama"
 
     def _enter_context(self):
         """Enter the scheduler context (init GDS, preload layers)."""
@@ -175,10 +210,11 @@ class InferenceEngine:
         self._context_entered = True
 
         if self._preload and isinstance(self._scheduler, CachedScheduler):
-            # Estimate activation VRAM for a reasonable max_seq_len
             max_seq_len = min(self.config.get("max_seq_len", 4096), 4096)
             min_free = estimate_activation_vram(self.config, max_seq_len)
             self._scheduler.cache.preload(min_free=min_free)
+        elif self._preload and isinstance(self._scheduler, QwenMoECachedScheduler):
+            self._scheduler.layer_cache.preload(min_free=512 * 1024 * 1024)
 
     def generate(
         self,
@@ -253,20 +289,27 @@ class InferenceEngine:
         prompt_len = input_ids.shape[1]
         max_total = prompt_len + max_tokens
 
-        # Allocate KV cache
-        kv = KVCache(
-            num_layers=self.config["num_layers"],
-            num_kv_heads=self.config["num_kv_heads"],
-            head_dim=self.config["head_dim"],
-            max_seq_len=max_total,
-        )
+        # Allocate appropriate cache based on model type
+        if self._model_type == "qwen3.5-moe":
+            cache = self._scheduler.create_cache(max_seq_len=max_total)
+            cache_key = "cache"
+        else:
+            cache = KVCache(
+                num_layers=self.config["num_layers"],
+                num_kv_heads=self.config["num_kv_heads"],
+                head_dim=self.config["head_dim"],
+                max_seq_len=max_total,
+            )
+            cache_key = "kv_cache"
 
         t_start = time.perf_counter_ns()
         completion_tokens = 0
         all_ids = input_ids  # track for repeat penalty
 
         # Phase 1: Prefill
-        logits = self._scheduler.forward(input_ids, kv_cache=kv, start_pos=0)
+        logits = self._scheduler.forward(
+            input_ids, **{cache_key: cache}, start_pos=0,
+        )
         next_token = _sample(logits, temperature, top_p, top_k, repeat_penalty, all_ids)
         t_prefill = time.perf_counter_ns()
         prefill_ns = t_prefill - t_start
@@ -293,7 +336,8 @@ class InferenceEngine:
             input_tensor = torch.tensor([[next_token]], dtype=torch.long)
             all_ids = torch.cat([all_ids, input_tensor], dim=1)
             logits = self._scheduler.forward(
-                input_tensor, kv_cache=kv, start_pos=kv.current_seq_len,
+                input_tensor, **{cache_key: cache},
+                start_pos=cache.current_seq_len,
             )
             next_token = _sample(logits, temperature, top_p, top_k, repeat_penalty, all_ids)
             completion_tokens += 1
@@ -334,7 +378,7 @@ class InferenceEngine:
         return {
             "name": self.model_name,
             "model_dir": self.model_dir,
-            "family": "llama",
+            "family": self._model_type,
             "parameter_size": self._guess_param_size(),
             "quantization": self.config.get("quantization", "none"),
             "hidden_size": self.config.get("hidden_size"),
