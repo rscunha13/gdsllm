@@ -7,14 +7,24 @@ NVMe SSD ──DMA──▶ GPU VRAM    (GdsLLM: ~7 GB/s, zero CPU copies)
 NVMe SSD ──▶ Page Cache ──▶ CPU RAM ──PCIe──▶ GPU VRAM    (traditional)
 ```
 
+## Supported Models
+
+| Model Family | Architecture | Quantization | Status |
+|-------------|-------------|-------------|--------|
+| LLaMA 2/3/3.x | Dense transformer | GGUF Q4_0, Q8_0, fp16 | Stable |
+| Qwen3.5-MoE (397B) | Hybrid attention + MoE | Affine Q4 (SWAN) | Working |
+
 ## Performance
 
 | Model | Quantization | Layers Cached | Throughput | Bottleneck |
 |-------|-------------|---------------|------------|------------|
 | LLaMA 7B | Q4_0 | All 32 (3.6 GB) | **59 tok/s** (17ms/tok) | GPU compute |
 | LLaMA 70B | Q4_0 | 6 of 80 | 0.15 tok/s (6.5s/tok) | NVMe bandwidth |
+| Qwen3.5-MoE 397B | Affine Q4 | 0 of 60 | NVMe-bound | NVMe bandwidth |
 
 *Hardware: RTX 4080 16GB, NVMe Gen4 x4 (~7 GB/s), CUDA 12.8*
+
+Qwen3.5-MoE uses **selective expert loading**: only 10 of 512 experts are loaded per token (~65 MB vs ~3.2 GB per layer), reducing NVMe bandwidth by 50x.
 
 ## Requirements
 
@@ -64,6 +74,9 @@ gdsllm list
 
 # Chat in the terminal
 gdsllm run Llama-2-7b-hf
+
+# Single prompt (non-interactive)
+gdsllm run Llama-2-7b-hf --prompt "What is the meaning of life?" --max-tokens 50
 
 # Start API server (Ollama + OpenAI compatible)
 gdsllm serve Llama-2-7b-hf --preload
@@ -153,16 +166,21 @@ gdsllm/
 │   ├── routes_openai.py   # OpenAI-compatible endpoints
 │   └── schemas.py         # Pydantic request/response models
 ├── runtime/
-│   ├── gds_io.cu          # cuFile DMA reads (NVMe → VRAM)
-│   ├── gguf_dequant.cu    # Q4_0 / Q8_0 GPU dequantization kernels
-│   ├── fused_gemv.cu      # Fused dequant + matrix-vector multiply
-│   ├── scheduler.py       # Layer residency scheduler (cached vs. streaming)
-│   ├── llama.py           # LLaMA forward pass
-│   └── kv_cache.py        # KV cache for autoregressive decoding
+│   ├── gds_io.cu              # cuFile DMA reads (NVMe → VRAM)
+│   ├── gguf_dequant.cu        # Q4_0 / Q8_0 GPU dequantization kernels
+│   ├── affine_q4_dequant.cu   # Affine Q4 dequant kernels (SWAN format)
+│   ├── fused_gemv.cu          # Fused dequant + matrix-vector multiply
+│   ├── scheduler.py           # Layer scheduler — LLaMA (cached vs. streaming)
+│   ├── qwen_moe_scheduler.py  # Layer scheduler — Qwen3.5-MoE (selective expert loading)
+│   ├── llama.py               # LLaMA forward pass
+│   ├── qwen_moe.py            # Qwen3.5-MoE forward pass (hybrid attn + MoE MLP)
+│   ├── kv_cache.py            # KV cache for autoregressive decoding
+│   └── hybrid_cache.py        # Hybrid KV + SSM state cache (Qwen3.5-MoE)
 └── tools/
-    ├── download_model.py   # HuggingFace model downloader
-    ├── convert_weights.py  # Safetensors → GdsLLM converter
-    └── convert_gguf.py     # GGUF → GdsLLM converter
+    ├── download_model.py       # HuggingFace model downloader
+    ├── convert_weights.py      # Safetensors → GdsLLM converter
+    ├── convert_gguf.py         # GGUF → GdsLLM converter
+    └── convert_qwen_moe.py     # Qwen3.5-MoE SWAN 4-bit → GdsLLM converter
 ```
 
 ## License
